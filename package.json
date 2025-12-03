@@ -1,0 +1,16 @@
+{
+  "name": "saibatin-urotera-demo",
+  "version": "2.0.0",
+  "description": "ASV Monitoring System with GeoTag Logging - KKI 2025",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "simulate": "node client-sim.js"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1",
+    "ws": "^8.14.2"
+  }
+}

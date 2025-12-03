@@ -1,0 +1,928 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <title>SAIBATIN AZURA 1.0 - Dashboard ASV</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <style>
+        @font-face {
+            font-family: 'SiderFont';
+            src: url('file-ngwyeoEN29l1M3O1QpdxCwkj-sider-font.ttf');
+        }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            background: #0a0e27;
+            color: #fff;
+            font-family: 'SiderFont', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            overflow-x: hidden;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+        
+        #header {
+            background: #1a1f3a;
+            padding: 5px 5px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 2px solid #2a3f5f;
+            flex-shrink: 0;
+        }
+        #header h1 {
+            font-size: 1em;
+            color: #ffd93d;
+            letter-spacing: 0.2px;
+        }
+        /* logo text only */
+        #header .logo {
+            font-size: 1em;
+            color: #a8dadc;
+        }
+        
+        /* BATTERY ALERT */
+        #batteryAlert {
+            position: fixed;
+            top: 70px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #e63946;
+            color: #fff;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-weight: bold;
+            z-index: 9999;
+            display: none;
+            animation: blink 1s infinite;
+            transition: all 0.3s ease;
+            opacity: 0;
+        }
+        #batteryAlert.show {
+            opacity: 1;
+        }
+        @keyframes blink {
+            0%, 50%, 100% { opacity: 1; }
+            25%, 75% { opacity: 0.5; }
+        }
+        
+        /* MAIN CONTAINER */
+        #container {
+            display: flex;
+            flex-direction: column;
+            flex: 1;
+            overflow: hidden;
+        }
+        
+        #main {
+            display: grid;
+            grid-template-columns: 1fr 2fr; /* perbesar panel kanan agar camera lebih luas */
+            gap: 5px;
+            padding: 5px;
+            flex: 1;
+            overflow: hidden;
+            height: calc(100vh - 150px);
+        }
+        
+        /* LEFT PANEL: MAP */
+        #leftpanel {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+        }
+        
+        .panel {
+            background: #151b33;
+            border-radius: 5px;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+            border: 1px solid #2a3f5f;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .panel.map-panel {
+            height: 100%;
+        }
+        
+        #map {
+            flex: 1;
+            width: 100%;
+        }
+        
+        .panel-title {
+            background: #1e2a47;
+            padding: 3px 4px;
+            font-size: 0.5em;
+            font-weight: bold;
+            color: #6dd5ed;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 2px solid #2a3f5f;
+            flex-shrink: 0;
+        }
+        
+        .ws-status {
+            font-size: 0.85em;
+            padding: 4px 12px;
+            border-radius: 12px;
+            background: #e63946;
+            color: #fff;
+        }
+        .ws-status.connected {
+            background: #06d6a0;
+        }
+        
+        /* RIGHT PANEL: ATTITUDE & MEDIA */
+        #rightpanel {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            height: 100%;
+            overflow: hidden;
+        }
+        
+        /* ATTITUDE PANEL */
+        .panel.attitude-panel {
+            flex-shrink: 0;
+        }
+        
+        .panel-content {
+            padding: 12px;
+        }
+        
+        /* ATTITUDE GRID - 4 KOLOM */
+        .attitude-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 5px;
+        }
+        .attitude-item {
+            background: #1a2238;
+            padding: 5px;
+            border-radius: 5px;
+            text-align: center;
+            border: 1px solid #2a3f5f;
+        }
+        .attitude-item .label {
+            font-size: 0.7em;
+            color: #a8dadc;
+            margin-bottom: 4px;
+        }
+        .attitude-item .value {
+            font-size: 0.8em;
+            color: #ffd93d;
+            font-weight: bold;
+        }
+        
+        /* Battery level color */
+        .battery-low {
+            color: #e63946 !important;
+            font-weight: bold;
+        }
+        .battery-medium {
+            color: #ffa500 !important;
+        }
+        .battery-high {
+            color: #06d6a0 !important;
+        }
+        
+        /* CHART & MEDIA ROW - BERSEBELAHAN */
+        /* chart removed — area becomes two-column: streamer (kiri) + photos (kanan) */
+        .chart-media-row {
+            display: grid;
+            grid-template-columns: 2fr 1fr; /* streamer lebih besar kiri, foto di kanan (optimal) */
+            gap: 6px;
+            flex: 1;
+            min-height: 0;
+        }
+        
+        /* MEDIA PANEL */
+        .panel.media-panel {
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+        
+        /* STREAMER (kiri) dan PHOTO GRID (kanan) */
+        .streamer-area {
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            flex: 1;
+            min-height: 260px;
+        }
+        .streamer-area .video-container {
+            width: 100%;
+            flex: 1; /* isi tinggi yang tersedia */
+            min-height: 300px;
+            max-height: 520px;
+            position: relative;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #1a2238;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .streamer-area .video-container canvas {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            background: #000;
+        }
+        
+        .streamer-area .video-container .loading-text {
+            position: absolute;
+            color: #a8dadc;
+            font-size: 1rem;
+            text-align: center;
+            pointer-events: none;
+        }
+        
+        /* kanan: grid untuk dua foto bertumpuk */
+        .photo-panel .photo-grid {
+            display: grid;
+            grid-template-rows: 1fr 1fr;
+            gap: 10px;
+            padding: 12px;
+            height: 100%;
+        }
+        .photo-grid .photo {
+            width: 100%;
+            height: 100%;
+            border-radius: 8px;
+            overflow: hidden;
+            border: 2px solid #2a3f5f;
+            background: linear-gradient(135deg, #132034 0%, #17243a 50%, #1f304b 100%);
+            position: relative;
+            color: #9fcbdc;
+            font-size: 0.85rem;
+            letter-spacing: 0.2px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 180px;
+        }
+        /* placeholder photos (no actual <img>) - label stays visible */
+        .photo-grid .photo .photo-label {
+            position: absolute;
+            top: 8px;
+            left: 8px;
+            background: rgba(0,0,0,0.45);
+            color: #cbeff6;
+            font-size: 0.8rem;
+            padding: 4px 8px;
+            border-radius: 4px;
+            line-height: 1;
+            pointer-events: none;
+            user-select: none;
+            z-index: 2;
+        }
+        
+        /* MIDPOINT TARGET OVERLAY */
+        #midpointOverlay {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 30px;
+            height: 30px;
+            margin-left: -15px;
+            margin-top: -15px;
+            border: 3px solid #ffd93d;
+            border-radius: 50%;
+            background: rgba(255, 217, 61, 0.3);
+            z-index: 5;
+            pointer-events: none;
+        }
+        
+        #targetLine {
+            position: absolute;
+            top: 50%;
+            left: 0;
+            width: 100%;
+            height: 2px;
+            background: rgba(255, 217, 61, 0.5);
+            z-index: 4;
+            pointer-events: none;
+            display: none;
+        }
+        
+        /* BOTTOM PANEL - POSITION LOG */
+        #bottomPanel {
+            padding: 0 5px 5px 5px;
+            flex-shrink: 0;
+            max-height: 200px;
+        }
+        
+        .panel-content.scrollable {
+            max-height: 180px;
+            overflow-y: auto;
+        }
+        
+        .panel-content::-webkit-scrollbar {
+            width: 6px;
+        }
+        .panel-content::-webkit-scrollbar-thumb {
+            background: #2a3f5f;
+            border-radius: 3px;
+        }
+        
+        /* LOG TABLE */
+        #logTable {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85em;
+            color: #e0e0e0;
+        }
+        #logTable thead {
+            background: #1e2a47;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+        #logTable th {
+            padding: 9px 7px;
+            text-align: left;
+            font-size: 0.82em;
+            color: #ffd93d;
+            border-bottom: 2px solid #2a3f5f;
+            white-space: nowrap;
+        }
+        #logTable td {
+            padding: 7px;
+            border-bottom: 1px solid #2a3f5f;
+            font-size: 0.82em;
+        }
+        #logTable tr:hover {
+            background: #1a2238;
+        }
+        #exportBtn {
+            background: #06d6a0;
+            color: #0a0e27;
+            font-weight: bold;
+            border: none;
+            border-radius: 6px;
+            padding: 6px 14px;
+            font-size: 0.9em;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-family: 'SiderFont', sans-serif;
+        }
+        #exportBtn:hover {
+            background: #05b589;
+            transform: translateY(-2px);
+        }
+        
+        /* auto-scroll toggle button near export */
+        #autoScrollBtn {
+            background: #06d6a0;
+            color: #0a0e27;
+            border: none;
+            border-radius: 6px;
+            padding: 6px 10px;
+            font-size: 0.82em;
+            cursor: pointer;
+            margin-left: 8px;
+        }
+        #autoScrollBtn.inactive {
+            background: #55677a;
+            color: #dfeff4;
+        }
+        
+        .empty-log {
+            text-align: center;
+            color: #a8dadc;
+            padding: 20px;
+            font-size: 0.9em;
+        }
+        
+        /* CONTROL PANEL STYLES */
+        .control-panel {
+            background: #1a2238;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            border: 2px solid #2a3f5f;
+        }
+        
+        .control-buttons {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin-top: 10px;
+        }
+        
+        .control-btn {
+            padding: 12px 20px;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.9em;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-family: 'SiderFont', sans-serif;
+        }
+        
+        .control-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+        }
+        
+        .control-btn.start {
+            background: #06d6a0;
+            color: #0a0e27;
+        }
+        
+        .control-btn.stop {
+            background: #ef476f;
+            color: #fff;
+        }
+        
+        .control-btn.abort {
+            background: #e63946;
+            color: #fff;
+        }
+        
+        .control-btn:disabled {
+            background: #555;
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
+        
+        .toggle-switch {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin: 10px 0;
+            padding: 10px;
+            background: #1a2238;
+            border-radius: 6px;
+        }
+        
+        .toggle-switch label {
+            color: #a8dadc;
+            font-size: 0.9em;
+        }
+        
+        .toggle-switch input[type="checkbox"] {
+            width: 50px;
+            height: 25px;
+            appearance: none;
+            background: #555;
+            border-radius: 25px;
+            position: relative;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .toggle-switch input[type="checkbox"]:checked {
+            background: #06d6a0;
+        }
+        
+        .toggle-switch input[type="checkbox"]::before {
+            content: '';
+            position: absolute;
+            width: 21px;
+            height: 21px;
+            border-radius: 50%;
+            background: #fff;
+            top: 2px;
+            left: 2px;
+            transition: all 0.3s;
+        }
+        
+        .toggle-switch input[type="checkbox"]:checked::before {
+            left: 27px;
+        }
+        
+        .mission-info {
+            margin-top: 10px;
+            padding: 10px;
+            background: rgba(6, 214, 160, 0.1);
+            border-radius: 6px;
+            color: #06d6a0;
+            font-size: 0.85em;
+            display: none;
+        }
+        
+        .mission-info.active {
+            display: block;
+        }
+        
+        /* HIDE VIDEO OVERLAY! */
+        .video-overlay {
+            display: none !important;
+        }
+        
+        .ball-status {
+            display: none !important;
+        }
+        
+        @media (max-width: 1024px) {
+            #main {
+                grid-template-columns: 1fr;
+                height: auto;
+                min-height: calc(100vh - 250px);
+            }
+            #leftpanel {
+                min-height: 400px;
+            }
+            #bottomPanel {
+                max-height: 150px;
+            }
+            .panel-content.scrollable {
+                max-height: 130px;
+            }
+            .chart-media-row {
+                grid-template-columns: 1fr;
+                grid-template-rows: auto auto;
+            }
+            .photo-panel .photo-grid {
+                grid-template-rows: 1fr 1fr;
+                min-height: 400px;
+            }
+            .photo-grid .photo {
+                min-height: 180px;
+            }
+        }
+     </style>
+ </head>
+ <body>
+    <!-- BATTERY ALERT -->
+    <div id="batteryAlert">⚠️ PERINGATAN: Battery < 20%!</div>
+    
+    <div id="header">
+        <h1>Nama Tim: SAIBATIN AZURA 1.0</h1>
+        <div class="logo">Institut Teknologi Sumatera</div>
+    </div>
+
+    <div id="container">
+        <div id="main">
+            <!-- LEFT PANEL: MAP -->
+            <div id="leftpanel">
+                <div class="panel map-panel">
+                    <div class="panel-title">
+                        Peta & Proyeksi Lintasan
+                        <span class="ws-status" id="wsStatus">🔴 Socket.IO: Terputus</span>
+                    </div>
+                    <div id="map"></div>
+                </div>
+            </div>
+
+            <!-- RIGHT PANEL: ATTITUDE, CHART & MEDIA -->
+            <div id="rightpanel">
+                <!-- CONTROL PANEL (SIMPLIFIED!) -->
+                <div class="panel control-panel">
+                    <div class="panel-title">Mission Control</div>
+                    <div class="control-buttons">
+                        <button class="control-btn start" id="btnStartMission">🚀 Start Mission</button>
+                        <button class="control-btn stop" id="btnStopMission" disabled>🛑 Stop Mission</button>
+                        <button class="control-btn abort" id="btnAbortMission" disabled>⚠️ Abort Mission</button>
+                    </div>
+                    
+                    <div class="mission-info" id="missionInfo">
+                        ⏳ Mission Status: Standby<br>
+                        <small>🚧 Obstacle Detection & 📷 Auto Photo akan aktif otomatis saat mission start</small>
+                    </div>
+                </div>
+
+                <!-- ATTITUDE INFORMATION -->
+                <div class="panel attitude-panel">
+                    <div class="panel-title">Attitude Information</div>
+                    <div class="panel-content">
+                        <div class="attitude-grid">
+                            <div class="attitude-item">
+                                <div class="label">Waktu</div>
+                                <div class="value" id="attTime">--:--:--</div>
+                            </div>
+                            <div class="attitude-item">
+                                <div class="label">Koordinat</div>
+                                <div class="value" id="attCoord">--, --</div>
+                            </div>
+                            <div class="attitude-item">
+                                <div class="label">Kecepatan</div>
+                                <div class="value" id="attSpeed">-- knot</div>
+                            </div>
+                            <div class="attitude-item">
+                                <div class="label">Heading</div>
+                                <div class="value" id="attHeading">--°</div>
+                            </div>
+                            <div class="attitude-item">
+                                <div class="label">Pitch</div>
+                                <div class="value" id="attPitch">--°</div>
+                            </div>
+                            <div class="attitude-item">
+                                <div class="label">Roll</div>
+                                <div class="value" id="attRoll">--°</div>
+                            </div>
+                            <div class="attitude-item">
+                                <div class="label">Battery</div>
+                                <div class="value battery-high" id="attBattery">--</div>
+                            </div>
+                            <div class="attitude-item">
+                                <div class="label">Mission Status</div>
+                                <div class="value" id="attMissionStatus">Standby</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- CHART & MEDIA BERSEBELAHAN (chart dihapus; kiri = streamer, kanan = foto) -->
+                <div class="chart-media-row">
+                    <!-- LEFT: Streamer Camera (mengisi area chart sebelumnya) -->
+                    <div class="panel media-panel streamer-area">
+                        <div class="panel-title">Camera Streamer</div>
+                        <div class="video-container">
+                            <!-- GANTI img dengan canvas untuk Socket.IO stream -->
+                            <canvas id="videoCanvas" width="640" height="480"></canvas>
+                            <div class="loading-text" id="loadingText">⏳ Menunggu stream kamera...</div>
+                            
+                            <!-- CENTER TARGET OVERLAY -->
+                            <div id="midpointOverlay"></div>
+                            <div id="targetLine"></div>
+                        </div>
+                    </div>
+                    
+                    <!-- RIGHT: Foto aksi (dua foto bertumpuk) -->
+                    <div class="panel photo-panel">
+                        <div class="panel-title">Foto Misi</div>
+                        <div class="photo-grid">
+                            <!-- placeholder boxes + label (no <img>) -->
+                            <div class="photo">
+                                <span id="surfaceLabel" class="photo-label">Foto Aksi — Surface</span>
+                            </div>
+                            <div class="photo">
+                                <span id="underwaterLabel" class="photo-label">Foto Aksi — Underwater</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- BOTTOM PANEL: POSITION LOG (FULL WIDTH) -->
+        <div id="bottomPanel">
+            <div class="panel">
+                <div class="panel-title">
+                    Position Log
+                    <div>
+                        <button id="exportBtn" onclick="exportLogCSV()">Export CSV</button>
+                        <button id="autoScrollBtn" class="active">Auto-scroll: ON</button>
+                    </div>
+                </div>
+                <div class="panel-content scrollable">
+                    <table id="logTable">
+                        <thead>
+                            <tr>
+                                <th>No</th>
+                                <th>Day</th>
+                                <th>Date</th>
+                                <th>Time</th>
+                                <th>Lat (DD)</th>
+                                <th>Lng (DD)</th>
+                                <th>Lat (DM)</th>
+                                <th>Lng (DM)</th>
+                                <th>SOG (knot)</th>
+                                <th>SOG (km/h)</th>
+                                <th>COG (°)</th>
+                            </tr>
+                        </thead>
+                        <tbody id="logTableBody">
+                            <tr>
+                                <td colspan="11" class="empty-log">Menunggu data dari kapal...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- LEAFLET JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <!-- SOCKET.IO -->
+    <script src="https://cdn.socket.io/4.6.0/socket.io.min.js"></script>
+    
+    <script>
+        // Prevent multiple executions
+        if (window.dashboardInitialized) {
+            console.warn('Dashboard already initialized, skipping...');
+        } else {
+            window.dashboardInitialized = true;
+            initDashboard();
+        }
+
+        function initDashboard() {
+            console.log('🚀 Dashboard Starting...');
+            
+            // Map init
+            const map = L.map('map').setView([-5.3972, 105.2668], 14);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+            const boatMarker = L.marker([-5.3972, 105.2668]).addTo(map);
+            const polyline = L.polyline([[-5.3972, 105.2668]], {color: '#ffd93d', weight: 3}).addTo(map);
+            let pathPoints = [[-5.3972, 105.2668]];
+            let geolog = [];
+            let lastRenderedCount = 0;
+
+            // Socket.IO (FIXED - ADD URL!)
+            const socket = io('http://localhost:5000', {  // ← FIX: Add URL!
+                reconnection: true,
+                reconnectionDelay: 1000,
+                reconnectionAttempts: 10,
+                transports: ['websocket', 'polling']
+            });
+
+            socket.on('connect', () => {
+                console.log('✅ Socket.IO Connected:', socket.id);
+                const wsStatus = document.getElementById('wsStatus');
+                if (wsStatus) {
+                    wsStatus.textContent = '🟢 Socket.IO: Terhubung';
+                    wsStatus.classList.add('connected');
+                }
+            });
+
+            socket.on('disconnect', () => {
+                console.log('❌ Socket.IO Disconnected');
+                const wsStatus = document.getElementById('wsStatus');
+                if (wsStatus) {
+                    wsStatus.textContent = '🔴 Socket.IO: Terputus';
+                    wsStatus.classList.remove('connected');
+                }
+            });
+
+            socket.on('connect_error', (error) => {
+                console.error('❌ Socket.IO Connection Error:', error);
+            });
+
+            // Video stream (Canvas)
+            const videoCanvas = document.getElementById('videoCanvas');
+            const ctx = videoCanvas ? videoCanvas.getContext('2d') : null;
+            const loadingText = document.getElementById('loadingText');
+            const tempImage = new Image();
+
+            socket.on('video_frame', (data) => {
+                if (data && data.image && ctx) {
+                    tempImage.onload = () => {
+                        try {
+                            ctx.drawImage(tempImage, 0, 0, 640, 480);
+                            if (loadingText) loadingText.style.display = 'none';
+                        } catch (e) {
+                            console.error('Draw error:', e);
+                        }
+                    };
+                    tempImage.src = 'data:image/jpeg;base64,' + data.image;
+                }
+            });
+
+            // GPS data handler (FIXED - update ALL elements!)
+            socket.on('update_dashboard', (data) => {
+                try {
+                    console.log('📊 GPS update:', data.Time); // Debug log
+                    
+                    const lat = parseFloat(data.Latitude_DD) || 0;
+                    const lng = parseFloat(data.Longitude_DD) || 0;
+                    const battery = parseFloat(data.Battery_) || 0;
+
+                    // Update ALL attitude panel elements
+                    const attTime = document.getElementById('attTime');
+                    const attCoord = document.getElementById('attCoord');
+                    const attSpeed = document.getElementById('attSpeed');
+                    const attHeading = document.getElementById('attHeading');
+                    const attPitch = document.getElementById('attPitch');
+                    const attRoll = document.getElementById('attRoll');
+                    const attBattery = document.getElementById('attBattery');
+                    const attMissionStatus = document.getElementById('attMissionStatus');
+
+                    if (attTime) attTime.textContent = data.Time || '--:--:--';
+                    if (attCoord) attCoord.textContent = `${data.Latitude_DD || '--'}, ${data.Longitude_DD || '--'}`;
+                    if (attSpeed) attSpeed.textContent = `${data.SOG_knot || '--'} knot`;
+                    if (attHeading) attHeading.textContent = `${data.COG_deg || '--'}°`;
+                    if (attPitch) attPitch.textContent = `${data.Pitch || '--'}°`;
+                    if (attRoll) attRoll.textContent = `${data.Roll || '--'}°`;
+                    if (attMissionStatus) attMissionStatus.textContent = data.Mission_Status || 'Standby';
+
+                    // Battery with color
+                    if (attBattery) {
+                        attBattery.textContent = `${battery.toFixed(1)}%`;
+                        attBattery.className = 'value'; // Reset classes
+                        if (battery < 20) {
+                            attBattery.classList.add('battery-low');
+                        } else if (battery < 50) {
+                            attBattery.classList.add('battery-medium');
+                        } else {
+                            attBattery.classList.add('battery-high');
+                        }
+                    }
+
+                    // Add to log array
+                    geolog.push({
+                        day: data.Day,
+                        date: data.Date,
+                        time: data.Time,
+                        latDD: data.Latitude_DD,
+                        lngDD: data.Longitude_DD,
+                        latDM: data.Latitude_DM,
+                        lngDM: data.Longitude_DM,
+                        sogKnot: data.SOG_knot,
+                        sogKmh: data.SOG_kmh,
+                        cog: data.COG_deg
+                    });
+
+                    // Update table
+                    updateLogTable();
+
+                    // Update map
+                    if (lat && lng) {
+                        boatMarker.setLatLng([lat, lng]);
+                        pathPoints.push([lat, lng]);
+                        polyline.setLatLngs(pathPoints);
+                    }
+                } catch (e) {
+                    console.error('❌ Update error:', e);
+                }
+            });
+
+            // Function to update log table
+            function updateLogTable() {
+                const tbody = document.getElementById('logTableBody');
+                if (!tbody) return;
+
+                if (geolog.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="11" class="empty-log">Belum ada data.</td></tr>';
+                    lastRenderedCount = 0;
+                    return;
+                }
+
+                // Render all rows (simple approach)
+                if (lastRenderedCount === 0 || geolog.length < lastRenderedCount) {
+                    const frag = document.createDocumentFragment();
+                    geolog.forEach((item, idx) => {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td>${idx + 1}</td>
+                            <td>${item.day}</td>
+                            <td>${item.date}</td>
+                            <td>${item.time}</td>
+                            <td>${item.latDD}</td>
+                            <td>${item.lngDD}</td>
+                            <td>${item.latDM}</td>
+                            <td>${item.lngDM}</td>
+                            <td>${item.sogKnot}</td>
+                            <td>${item.sogKmh}</td>
+                            <td>${item.cog}</td>
+                        `;
+                        frag.appendChild(tr);
+                    });
+                    tbody.innerHTML = '';
+                    tbody.appendChild(frag);
+                    lastRenderedCount = geolog.length;
+                } else if (geolog.length > lastRenderedCount) {
+                    // Append only new rows
+                    const frag = document.createDocumentFragment();
+                    for (let i = lastRenderedCount; i < geolog.length; i++) {
+                        const item = geolog[i];
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td>${i + 1}</td>
+                            <td>${item.day}</td>
+                            <td>${item.date}</td>
+                            <td>${item.time}</td>
+                            <td>${item.latDD}</td>
+                            <td>${item.lngDD}</td>
+                            <td>${item.latDM}</td>
+                            <td>${item.lngDM}</td>
+                            <td>${item.sogKnot}</td>
+                            <td>${item.sogKmh}</td>
+                            <td>${item.cog}</td>
+                        `;
+                        frag.appendChild(tr);
+                    }
+                    tbody.appendChild(frag);
+                    lastRenderedCount = geolog.length;
+                }
+
+                // Auto-scroll to bottom
+                const container = document.querySelector('.panel-content.scrollable');
+                if (container) {
+                    container.scrollTop = container.scrollHeight;
+                }
+            }
+
+            console.log('✅ Dashboard initialized');
+        }
+
+        // Export function (global)
+        window.exportLogCSV = function() {
+            alert('Export CSV feature - implement if needed');
+        };
+    </script>
+</body>
+</html>
