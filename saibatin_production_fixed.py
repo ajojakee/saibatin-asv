@@ -83,16 +83,20 @@ PWM_MIN = 1100  # Minimum PWM (full reverse)
 PWM_MID = 1500  # Neutral PWM (stop)
 PWM_MAX = 1900  # Maximum PWM (full forward)
 
-# Ball detection HSV threshold (UPDATED dari kode kalibr asi Anda!)
+# Ball detection HSV threshold (UPDATED!)
 # Pylox Red 33 - Range diperketat
-RED_LOWER1 = np.array([0, 120, 150])    # ← UPDATED! Dari kode Anda
+RED_LOWER1 = np.array([0, 120, 150])
 RED_UPPER1 = np.array([10, 255, 255])
-RED_LOWER2 = np.array([170, 120, 150])  # ← UPDATED!
+RED_LOWER2 = np.array([170, 120, 150])
 RED_UPPER2 = np.array([180, 255, 255])
 
-# Pylox Green 105 - Range diperketat
-GREEN_LOWER = np.array([45, 120, 120])  # ← UPDATED! Dari kode Anda
-GREEN_UPPER = np.array([70, 255, 255])  # Bright, high saturation
+# Pylox Green 105 - RELAX range + SHAPE FILTER
+# Karena bola hijau muda mirip air, kita tambah circularity check
+GREEN_LOWER = np.array([45, 100, 100])  # ← RELAX kembali (untuk detect bola hijau muda)
+GREEN_UPPER = np.array([75, 255, 255])  # ← Range lebih lebar
+
+MIN_BALL_RADIUS = 15
+MIN_CIRCULARITY = 0.7  # ← NEW! Minimum circularity (0-1, 1=perfect circle)
 
 # NEW: Blue ball detection for underwater photo trigger
 BLUE_LOWER = np.array([100, 150, 50])   # Blue hue (100-130°)
@@ -165,18 +169,40 @@ obstacle_lock = threading.Lock()
 latest_obstacles = []
 
 # ========== MISSION CONFIG & GATES ==========
-GATES_LIST = [
-    (-5.39720, 105.26680, False),  # Gate 1: surface only
-    (-5.39725, 105.26685, True),   # Gate 2: surface + underwater
-    (-5.39730, 105.26690, True),   # Gate 3: surface + underwater
-    (-5.39735, 105.26695, False),  # Gate 4: surface only
-    (-5.39740, 105.26700, True),   # Gate 5: surface + underwater
-    (-5.39745, 105.26705, True),   # Gate 6: surface + underwater
-    (-5.39750, 105.26710, False),  # Gate 7: surface only
-    (-5.39755, 105.26715, True),   # Gate 8: surface + underwater
-    (-5.39760, 105.26720, True),   # Gate 9: surface + underwater
-    (-5.39765, 105.26725, False),  # Gate 10: surface only
-    (-5.39770, 105.26730, False),  # Dock (final position)
+# TODO: UPDATE KOORDINAT GPS SESUAI ARENA LOMBA ANDA!
+# Load gates from CSV file (OPTIONAL)
+def load_gates_from_csv(filename='gates.csv'):
+    """Load gate coordinates from CSV file"""
+    gates = []
+    try:
+        import csv
+        with open(filename, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                lat = float(row['latitude'])
+                lon = float(row['longitude'])
+                underwater = row['underwater'].lower() == 'true'
+                gates.append((lat, lon, underwater))
+        logger.info(f"✅ Loaded {len(gates)} gates from {filename}")
+        return gates
+    except Exception as e:
+        logger.error(f"❌ Failed to load gates from CSV: {e}")
+        return None
+
+# Try load from CSV, fallback to hardcoded
+GATES_LIST = load_gates_from_csv('gates.csv') or [
+    # Fallback hardcoded gates
+    (-5.39720, 105.26680, False),
+    (-5.39725, 105.26685, True),   # Gate 2: surface + underwater - GANTI koordinat!
+    (-5.39730, 105.26690, True),   # Gate 3: surface + underwater - GANTI koordinat!
+    (-5.39735, 105.26695, False),  # Gate 4: surface only - GANTI koordinat!
+    (-5.39740, 105.26700, True),   # Gate 5: surface + underwater - GANTI koordinat!
+    (-5.39745, 105.26705, True),   # Gate 6: surface + underwater - GANTI koordinat!
+    (-5.39750, 105.26710, False),  # Gate 7: surface only - GANTI koordinat!
+    (-5.39755, 105.26715, True),   # Gate 8: surface + underwater - GANTI koordinat!
+    (-5.39760, 105.26720, True),   # Gate 9: surface + underwater - GANTI koordinat!
+    (-5.39765, 105.26725, False),  # Gate 10: surface only - GANTI koordinat!
+    (-5.39770, 105.26730, False),  # Dock (final position) - GANTI koordinat!
 ]
 
 MISSION_CFG = MissionConfig(
@@ -510,7 +536,10 @@ def init_dual_cameras():
 
 # ========== BALL DETECTION ==========
 def detect_ball(frame_bgr, lower, upper, lower2=None, upper2=None):
-    # TAMBAHKAN GAUSSIAN BLUR! (dari kode Anda)
+    """
+    Detect ball with COLOR + SHAPE filtering
+    Returns: {'x', 'y', 'radius', 'circularity'} or None
+    """
     blurred = cv2.GaussianBlur(frame_bgr, (7, 7), 0)
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
     
@@ -520,20 +549,51 @@ def detect_ball(frame_bgr, lower, upper, lower2=None, upper2=None):
         mask = cv2.inRange(hsv, lower, upper)
     
     kernel = np.ones((5, 5), np.uint8)
-    # TAMBAHKAN MORPHOLOGY! (dari kode Anda)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.dilate(mask, kernel, iterations=2)
     
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        largest = max(contours, key=cv2.contourArea)
-        ((x, y), radius) = cv2.minEnclosingCircle(largest)
+    
+    # BEST BALL SELECTION: Filter by circularity + size
+    best_ball = None
+    best_score = 0
+    
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < 500:  # Min area
+            continue
         
-        # TAMBAHKAN MIN AREA CHECK! (dari kode Anda)
-        area = cv2.contourArea(largest)
-        if radius > MIN_BALL_RADIUS and area > 500:  # min_area = 500
-            return {'x': int(x), 'y': int(y), 'radius': int(radius)}
-    return None
+        # Calculate circularity
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter == 0:
+            continue
+        circularity = 4 * math.pi * area / (perimeter * perimeter)
+        
+        # Get enclosing circle
+        ((x, y), radius) = cv2.minEnclosingCircle(contour)
+        
+        # Validate: radius + circularity
+        if radius < MIN_BALL_RADIUS:
+            continue
+        
+        if circularity < MIN_CIRCULARITY:
+            logger.debug(f"   Rejected: circularity {circularity:.2f} < {MIN_CIRCULARITY}")
+            continue
+        
+        # Score: circularity * area (prefer circular + large objects)
+        score = circularity * area
+        
+        if score > best_score:
+            best_score = score
+            best_ball = {
+                'x': int(x),
+                'y': int(y),
+                'radius': int(radius),
+                'circularity': round(circularity, 2),
+                'area': int(area)
+            }
+    
+    return best_ball
 
 def calculate_navigation(red_ball, green_ball):
     """Calculate navigation with gate position validation"""
@@ -571,7 +631,252 @@ def calculate_navigation(red_ball, green_ball):
     
     return mid_x, mid_y, heading_adj, gate_type
 
-# ...existing code...
+# ========== PHOTO CAPTURE & SAVE ==========
+def save_and_emit_photo(frame, capture_type: str, gate_index: int):
+    """Save photo to disk and emit to dashboard"""
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"gate{gate_index}_{capture_type}_{timestamp}.jpg"
+        filepath = f"captures/{filename}"
+
+        # Create captures directory if not exists
+        os.makedirs("captures", exist_ok=True)
+
+        # Save to disk
+        cv2.imwrite(filepath, frame)
+        logger.info(f"💾 Saved {filepath}")
+
+        # Encode and emit to dashboard
+        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        jpg_base64 = base64.b64encode(buffer).decode('utf-8')
+
+        if sio.connected:
+            sio.emit('photo_captured', {
+                'type': capture_type,
+                'gate': gate_index,
+                'filename': filename,
+                'image': jpg_base64,
+                'timestamp': timestamp
+            })
+    except Exception as e:
+        logger.error(f"❌ save_and_emit_photo error: {e}")
+
+# ========== CALLBACK IMPLEMENTATIONS =========
+def on_capture_callback(capture_type: str, gate_index: int):
+    """Called by state machine to capture photo"""
+    logger.info(f"📸 Capture {capture_type} at gate {gate_index}")
+
+    if capture_type == "surface":
+        with frame_lock:
+            if latest_frame is None:
+                logger.warning("No frame available for surface capture")
+                return
+            frame_copy = latest_frame.copy()
+        save_and_emit_photo(frame_copy, capture_type="surface", gate_index=gate_index)
+
+    elif capture_type == "underwater":
+        if camera_underwater and camera_underwater.isOpened():
+            ret, frame = camera_underwater.read()
+            if ret:
+                save_and_emit_photo(frame, capture_type="underwater", gate_index=gate_index)
+            else:
+                logger.warning("Underwater camera read failed")
+        else:
+            logger.warning("Underwater camera not available")
+
+def on_lower_callback(gate_index: int):
+    """Called by state machine to lower underwater camera"""
+    logger.info(f"⬇️ Lower camera at gate {gate_index}")
+    if sio.connected:
+        sio.emit('mission_event', {'event': 'lower_camera', 'gate': gate_index})
+
+def on_raise_callback(gate_index: int):
+    """Called by state machine to raise underwater camera"""
+    logger.info(f"⬆️ Raise camera at gate {gate_index}")
+    if sio.connected:
+        sio.emit('mission_event', {'event': 'raise_camera', 'gate': gate_index})
+
+def on_navigate_callback(target: Tuple[float, float]):
+    """Called by state machine to navigate to waypoint"""
+    lat, lon = target
+    logger.info(f"🧭 Navigate to ({lat:.6f}, {lon:.6f})")
+
+def on_emit_event(event_name: str, payload: dict):
+    """Called by state machine to emit mission events to dashboard"""
+    logger.info(f"📡 Event: {event_name} → {payload}")
+    if sio.connected:
+        sio.emit('mission_event', {'event': event_name, **payload})
+
+# ========== TELEMETRY FORWARDER =========
+def telemetry_forwarder():
+    """Thread: forward GPS telemetry to state machine"""
+    global mission_sm
+    logger.info("Telemetry forwarder started")
+
+    while not stop_event.is_set():
+        try:
+            with gps_data_lock:
+                lat = latest_gps_data.get('Latitude_DD')
+                lon = latest_gps_data.get('Longitude_DD')
+                sog_str = latest_gps_data.get('SOG_knot', '0')
+                cog_str = latest_gps_data.get('COG_deg', '0')
+
+            if mission_sm:
+                # Update position
+                if lat and lon:
+                    try:
+                        latf = float(lat)
+                        lonf = float(lon)
+                        mission_sm.update_position(latf, lonf)
+                    except Exception:
+                        pass
+
+                # Update speed (knot → m/s)
+                try:
+                    speed_kn = float(sog_str)
+                    speed_ms = speed_kn * 0.514444
+                    mission_sm.update_speed(speed_ms)
+                except Exception:
+                    pass
+
+                # Update heading
+                try:
+                    heading_val = float(cog_str)
+                    mission_sm.update_heading(heading_val)
+                except Exception:
+                    pass
+        except Exception:
+            logger.exception("Telemetry forwarder error")
+
+        if stop_event.wait(0.5):
+            break
+
+# ========== MOTOR CONTROL (GPIO Direct!) ==========
+pwm_left_gpio = None
+pwm_right_gpio = None
+
+def init_gpio_motors():
+    """Initialize GPIO motor control (bypass Pixhawk)"""
+    global pwm_left_gpio, pwm_right_gpio
+    
+    if not GPIO_AVAILABLE:
+        logger.warning("⚠️ GPIO not available for motor control")
+        return False
+    
+    try:
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(MOTOR_LEFT_GPIO, GPIO.OUT)
+        GPIO.setup(MOTOR_RIGHT_GPIO, GPIO.OUT)
+        
+        pwm_left_gpio = GPIO.PWM(MOTOR_LEFT_GPIO, PWM_FREQ_GPIO)
+        pwm_right_gpio = GPIO.PWM(MOTOR_RIGHT_GPIO, PWM_FREQ_GPIO)
+        
+        # Start at neutral (1500µs = 7.5% duty cycle)
+        pwm_left_gpio.start(7.5)
+        pwm_right_gpio.start(7.5)
+        
+        logger.info("✅ GPIO motor control initialized")
+        logger.info(f"   Motor Left: GPIO {MOTOR_LEFT_GPIO}")
+        logger.info(f"   Motor Right: GPIO {MOTOR_RIGHT_GPIO}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ GPIO motor init error: {e}")
+        return False
+
+def set_motor_left(speed_percent):
+    """Control left motor via GPIO (direct ESC control)"""
+    if not GPIO_AVAILABLE or pwm_left_gpio is None:
+        logger.debug(f"Motor Left: {speed_percent}% (GPIO not available)")
+        return
+    
+    try:
+        duty_cycle = 7.5 + (speed_percent / 100.0) * 2.5
+        duty_cycle = max(5.0, min(10.0, duty_cycle))
+        pwm_left_gpio.ChangeDutyCycle(duty_cycle)
+        logger.debug(f"⚡ Motor LEFT: {speed_percent}% → {duty_cycle:.2f}% duty")
+    except Exception as e:
+        logger.error(f"❌ Motor left error: {e}")
+
+def set_motor_right(speed_percent):
+    """Control right motor via GPIO (direct ESC control)"""
+    if not GPIO_AVAILABLE or pwm_right_gpio is None:
+        logger.debug(f"Motor Right: {speed_percent}% (GPIO not available)")
+        return
+    
+    try:
+        duty_cycle = 7.5 + (speed_percent / 100.0) * 2.5
+        duty_cycle = max(5.0, min(10.0, duty_cycle))
+        pwm_right_gpio.ChangeDutyCycle(duty_cycle)
+        logger.debug(f"⚡ Motor RIGHT: {speed_percent}% → {duty_cycle:.2f}% duty")
+    except Exception as e:
+        logger.error(f"❌ Motor right error: {e}")
+
+def set_differential_drive(throttle_percent, steering_percent):
+    """Control differential drive (2 motors)"""
+    try:
+        if steering_percent < 0:
+            left_speed = throttle_percent * (1 + steering_percent / 100.0)
+            right_speed = throttle_percent
+        elif steering_percent > 0:
+            left_speed = throttle_percent
+            right_speed = throttle_percent * (1 - steering_percent / 100.0)
+        else:
+            left_speed = throttle_percent
+            right_speed = throttle_percent
+        
+        left_speed = max(-100, min(100, left_speed))
+        right_speed = max(-100, min(100, right_speed))
+        
+        set_motor_left(left_speed)
+        set_motor_right(right_speed)
+        
+        logger.debug(f"🚢 Diff: T={throttle_percent}% S={steering_percent}% | L={left_speed:.1f}% R={right_speed:.1f}%")
+    except Exception as e:
+        logger.error(f"❌ Differential drive error: {e}")
+        stop_motors()
+
+def stop_motors():
+    """Emergency stop all motors"""
+    set_motor_left(0)
+    set_motor_right(0)
+    logger.info("🛑 Motors stopped")
+
+def navigate_to_gate_center(mid_x, heading_adj):
+    """Navigate ASV to center of gate using differential drive"""
+    global mission_active
+    
+    with mission_control_lock:
+        if not mission_active:
+            logger.debug("Navigation skipped - mission not active")
+            return False
+    
+    try:
+        offset_from_center = mid_x - (CAMERA_WIDTH / 2)
+        steering_percent = (offset_from_center / (CAMERA_WIDTH / 2)) * 100
+        steering_percent = max(-100, min(100, steering_percent))
+        
+        if abs(steering_percent) > 50:
+            throttle_percent = 30
+        elif abs(steering_percent) > 20:
+            throttle_percent = 50
+        else:
+            throttle_percent = 70
+        
+        set_differential_drive(throttle_percent, steering_percent)
+        
+        logger.info(f"🚢 Navigate: Offset={offset_from_center:.1f}px | Steering={steering_percent:.1f}%")
+        
+        if abs(offset_from_center) < OFFSET_THRESHOLD:
+            logger.info("✅ Gate centered!")
+            set_differential_drive(80, 0)
+            return True
+        
+        return False
+    except Exception as e:
+        logger.error(f"❌ Navigation error: {e}")
+        stop_motors()
+        return False
 
 # ========== CAMERA STREAM LOOP ==========
 def camera_stream_loop():
@@ -1029,8 +1334,8 @@ def main():
 
     SOCKETIO_SERVER = args.server
     CAMERA_NAVIGATION = args.camera_nav
-    CAMERA_UNDERWATER = args.camera_under  # ← FIX: Ini yang hilang!
-    SEND_FPS = max(1, args.send_fps)      # ← FIX: Ini yang hilang!
+    CAMERA_UNDERWATER = args.camera_under
+    SEND_FPS = max(1, args.send_fps)
 
     logger.info("🚀 SAIBATIN AZURA 1.0 - STARTING (with Mission SM)")
     logger.info("=" * 60)
@@ -1043,7 +1348,7 @@ def main():
     logger.info("🔌 Connecting to Pixhawk...")
     connect_pixhawk()
     
-    # Initialize GPIO motors (NEW!)
+    # Initialize GPIO motors
     logger.info("⚡ Initializing GPIO motor control...")
     init_gpio_motors()
 
@@ -1121,7 +1426,7 @@ def main():
             sio.disconnect()
             logger.info("✅ Disconnected from dashboard")
         
-        # Cleanup GPIO motors (NEW!)
+        # Cleanup GPIO motors
         if GPIO_AVAILABLE and pwm_left_gpio and pwm_right_gpio:
             try:
                 pwm_left_gpio.stop()
