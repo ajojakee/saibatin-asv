@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-SAIBATIN AZURA 1.0 - ALL-IN-ONE MISSION SYSTEM (fixed & improved)
-Now with Mission State Machine integration and fixes:
-- non-blocking Socket.IO connect (background, backoff)
-- obstacle_lock and latest_obstacles defined
-- single (updated) camera_stream_loop (with obstacle detection)
-- responsive stop_event checks in gps loop
-- minor robustness improvements
+SAIBATIN AZURA 1.0 - FINAL COMPETITION VERSION
+Default Mode: LINTASAN-A (3→4→3 obstacles, RED=right GREEN=left)
++ Emergency Return to Start feature
++ Dashboard return command
 """
 
 import cv2
@@ -16,17 +13,18 @@ import base64
 import time
 import threading
 from datetime import datetime
-import random
 import math
-import argparse
 import sys
-import traceback
 import logging
 import os
-from typing import Tuple
-from mission_state_machine import MissionStateMachine, MissionConfig, MissionState
 
-# ========== LOGGING SETUP ==========
+try:
+    import RPi.GPIO as GPIO
+    GPIO_AVAILABLE = True
+except ImportError:
+    GPIO_AVAILABLE = False
+
+# ========== LOGGING ==========
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -37,186 +35,65 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Try import Pixhawk support
-try:
-    from pymavlink import mavutil
-    MAVLINK_AVAILABLE = True
-except Exception:
-    MAVLINK_AVAILABLE = False
-    logger.warning("⚠️ pymavlink not available - GPS dummy mode")
+# ========== CONFIG ==========
+# DASHBOARD SERVER - CHOOSE ONE:
 
-# Try import GPIO support for direct motor control
-try:
-    import RPi.GPIO as GPIO
-    GPIO_AVAILABLE = True
-    # GPIO Motor Pins
-    MOTOR_LEFT_GPIO = 18   # GPIO 18 - Motor Kiri
-    MOTOR_RIGHT_GPIO = 13  # GPIO 13 - Motor Kanan
-    PWM_FREQ_GPIO = 50     # 50Hz for ESC
-except ImportError:
-    GPIO_AVAILABLE = False
-    logger.warning("⚠️ RPi.GPIO not available - motor control disabled")
+# MODE 1: PRODUCTION (Hosting - untuk lomba)
+SOCKETIO_SERVER = "http://saibatinazura.site:5000"  # ← UNCOMMENT untuk lomba
 
-# ========== KONFIGURASI ==========
+# MODE 2: LOCAL TESTING (Laptop - untuk development)
+# SOCKETIO_SERVER = "http://10.115.96.157:5000"  # ← UNCOMMENT untuk test local
+
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
-SOCKETIO_SERVER = "http://10.132.119.157:5000"  # ← FIXED! IP laptop yang BENAR!
+CAMERA_NAVIGATION = 0
 
-# Dual camera setup
-CAMERA_NAVIGATION = 0  # Logitech C270 for navigation + surface
-CAMERA_UNDERWATER = 1  # Brica PRO for underwater (USB mode)
+MOTOR_LEFT_GPIO = 18
+MOTOR_RIGHT_GPIO = 13
+PWM_FREQ_GPIO = 50
 
-# Brica PRO WiFi streaming (if not using USB)
-BRICA_WIFI_STREAM = "http://192.168.0.1:8080/video"
-BRICA_PHOTO_CAPTURE_URL = "http://192.168.0.1:8080/photo"
-USE_BRICA_WIFI = False  # ← CHANGED to False! Disable WiFi untuk test dulu
+# Motor capabilities (IMPORTANT!)
+MOTOR_FORWARD_ONLY = True  # ← Motors CANNOT reverse (brushless ESC)
 
-# Pixhawk ports
-PIXHAWK_PORTS = ["/dev/ttyAMA0", "/dev/ttyACM0", "/dev/ttyUSB0"]
-PIXHAWK_BAUD = 57600
-
-# Motor control parameters (FINAL FIX!)
-PWM_MOTOR_LEFT_CHANNEL = 4   # ← Channel 4 = Motor Kiri (SERVO4_FUNCTION = 73)
-PWM_MOTOR_RIGHT_CHANNEL = 5  # ← Channel 5 = Motor Kanan (SERVO5_FUNCTION = 74)
-
-PWM_MIN = 1100  # Minimum PWM (full reverse)
-PWM_MID = 1500  # Neutral PWM (stop)
-PWM_MAX = 1900  # Maximum PWM (full forward)
-
-# Ball detection HSV threshold (UPDATED!)
-# Pylox Red 33 - Range diperketat
-RED_LOWER1 = np.array([0, 120, 150])
+# Ball detection
+RED_LOWER1 = np.array([0, 100, 120])
 RED_UPPER1 = np.array([10, 255, 255])
-RED_LOWER2 = np.array([170, 120, 150])
+RED_LOWER2 = np.array([170, 100, 120])
 RED_UPPER2 = np.array([180, 255, 255])
+GREEN_LOWER = np.array([40, 80, 80])
+GREEN_UPPER = np.array([80, 255, 255])
 
-# Pylox Green 105 - RELAX range + SHAPE FILTER
-# Karena bola hijau muda mirip air, kita tambah circularity check
-GREEN_LOWER = np.array([45, 100, 100])  # ← RELAX kembali (untuk detect bola hijau muda)
-GREEN_UPPER = np.array([75, 255, 255])  # ← Range lebih lebar
+MIN_BALL_RADIUS = 12
+MIN_CIRCULARITY = 0.6
+MIN_BALL_SEPARATION = 25
+MAX_BALL_SEPARATION = 450
 
-MIN_BALL_RADIUS = 15
-MIN_CIRCULARITY = 0.7  # ← NEW! Minimum circularity (0-1, 1=perfect circle)
+OFFSET_THRESHOLD = 40
+BASE_SPEED = 55
+TURN_SPEED = 0.7
 
-# NEW: Blue ball detection for underwater photo trigger
-BLUE_LOWER = np.array([100, 150, 50])   # Blue hue (100-130°)
-BLUE_UPPER = np.array([130, 255, 255])  # Bright blue
+SEGMENT_OBSTACLES = [3, 4, 3]
+TOTAL_OBSTACLES = sum(SEGMENT_OBSTACLES)
 
-MIN_BALL_RADIUS = 15  # Minimum radius in pixels to consider as valid ball
+# Emergency return parameters
+MAX_NO_GATE_TIME = 60.0  # seconds - if no gate detected for 60s, return to start
+MAX_STUCK_TIME = 90.0    # seconds - if stuck at same obstacle, return to start
+EMERGENCY_RETURN_ENABLED = True
 
-# Underwater photo trigger parameters (NEW!)
-UNDERWATER_PHOTO_COOLDOWN = 5.0  # seconds - cooldown between captures
-last_underwater_photo_time = 0
-
-# Gate detection parameters
-MIN_GATE_DISTANCE = 5.0  # Minimum jarak ke gate untuk mulai deteksi (meter)
-MAX_GATE_DISTANCE = 50.0  # Maximum jarak deteksi gate (meter)
-MIN_BALL_SEPARATION = 30  # Minimum jarak pixel antar red-green ball (untuk validasi gate)
-MAX_BALL_SEPARATION = 400  # Maximum jarak pixel antar red-green ball (terlalu jauh = bukan gate)
-
-# Navigation parameters
-AUTONOMOUS_MODE = True  # Enable autonomous navigation
-TARGET_SPEED = 2.0  # m/s
-HEADING_THRESHOLD = 10  # degrees
-OFFSET_THRESHOLD = 50  # pixels
-
-# Mission control flag (NEW!)
-mission_active = False  # Flag untuk kontrol motor (False = standby, True = mission running)
-mission_control_lock = threading.Lock()
-
-# Rate limiting
-SEND_FPS = 10
-SEND_INTERVAL = 1 / SEND_FPS
-
-# Obstacle detection parameters
-OBSTACLE_MIN_AREA = 800  # ← UPDATED! Lebih besar dari bola (500)
-OBSTACLE_MIN_WIDTH = 40  # ← NEW! Minimum width in pixels
-OBSTACLE_REFERENCE_WIDTH = 0.3  # ← UPDATED! reference width (meter) - lebih realistic
-OBSTACLE_REFERENCE_PIXELS = 100
-FOCAL_LENGTH = 600  # approximate focal length (calibrate)
-MAX_OBSTACLE_DISTANCE = 20.0  # meters
-
-# Docking parameters (GPS-based only)
-DOCKING_DISTANCE_THRESHOLD = 5.0  # meters - switch to precision mode
-DOCKING_FINAL_THRESHOLD = 1.0     # meters - consider docked
-DOCKING_SPEED_SLOW = 20           # percent - slow approach speed
-DOCKING_HEADING_PRECISION = 5     # degrees - precision heading tolerance
-
-# ========== GLOBAL ==========
-sio = socketio.Client()
-camera_nav = None  # Logitech for navigation
-camera_underwater = None  # Brica for underwater
-mavlink_connection = None
-latest_gps_data = {}
-mission_status = "Standby"
-data_send_count = 0
-current_heading = 0
-target_heading = 0
-balls_passed = 0
-mission_sm = None  # State machine instance
-
-# Thread control
+mission_active = False
+mission_lock = threading.Lock()
 stop_event = threading.Event()
-frame_lock = threading.Lock()
+
+current_segment = 0
+obstacles_in_segment = 0
+total_obstacles_passed = 0
+
+sio = socketio.Client()
+camera_nav = None
+pwm_left_gpio = None
+pwm_right_gpio = None
 latest_frame = None
-
-# For thread-safe GPS data access
-gps_data_lock = threading.Lock()
-gps_data_event = threading.Event()
-
-# Obstacle shared data & lock (fixed: previously missing)
-obstacle_lock = threading.Lock()
-latest_obstacles = []
-
-# ========== MISSION CONFIG & GATES ==========
-# TODO: UPDATE KOORDINAT GPS SESUAI ARENA LOMBA ANDA!
-# Load gates from CSV file (OPTIONAL)
-def load_gates_from_csv(filename='gates.csv'):
-    """Load gate coordinates from CSV file"""
-    gates = []
-    try:
-        import csv
-        with open(filename, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                lat = float(row['latitude'])
-                lon = float(row['longitude'])
-                underwater = row['underwater'].lower() == 'true'
-                gates.append((lat, lon, underwater))
-        logger.info(f"✅ Loaded {len(gates)} gates from {filename}")
-        return gates
-    except Exception as e:
-        logger.error(f"❌ Failed to load gates from CSV: {e}")
-        return None
-
-# Try load from CSV, fallback to hardcoded
-GATES_LIST = load_gates_from_csv('gates.csv') or [
-    # Fallback hardcoded gates
-    (-5.39720, 105.26680, False),
-    (-5.39725, 105.26685, True),   # Gate 2: surface + underwater - GANTI koordinat!
-    (-5.39730, 105.26690, True),   # Gate 3: surface + underwater - GANTI koordinat!
-    (-5.39735, 105.26695, False),  # Gate 4: surface only - GANTI koordinat!
-    (-5.39740, 105.26700, True),   # Gate 5: surface + underwater - GANTI koordinat!
-    (-5.39745, 105.26705, True),   # Gate 6: surface + underwater - GANTI koordinat!
-    (-5.39750, 105.26710, False),  # Gate 7: surface only - GANTI koordinat!
-    (-5.39755, 105.26715, True),   # Gate 8: surface + underwater - GANTI koordinat!
-    (-5.39760, 105.26720, True),   # Gate 9: surface + underwater - GANTI koordinat!
-    (-5.39765, 105.26725, False),  # Gate 10: surface only - GANTI koordinat!
-    (-5.39770, 105.26730, False),  # Dock (final position) - GANTI koordinat!
-]
-
-MISSION_CFG = MissionConfig(
-    gate_trigger_dist_m=3.0,
-    speed_threshold_m_s=0.5,
-    heading_threshold_deg=15.0,
-    settle_time_s=1.0,
-    burst_count=3,
-    burst_interval_s=0.5,
-    depth_threshold_m=0.5,
-    lower_timeout_s=20.0,
-    max_retries=2,
-    loop_interval_s=0.25
-)
+frame_lock = threading.Lock()
 
 # ========== SOCKET.IO ==========
 @sio.event
@@ -227,326 +104,161 @@ def connect():
 def disconnect():
     logger.warning("❌ Disconnected from Dashboard")
 
+@sio.event
+def mission_command(data):
+    global mission_active
+    command = data.get('command')
+    logger.info(f"📥 Command: {command}")
+    
+    with mission_lock:
+        if command == 'start':
+            mission_active = True
+            logger.info("🚀 MISSION STARTED!")
+            if sio.connected:
+                sio.emit('mission_status_update', {
+                    'status': 'active',
+                    'message': 'Mission started - navigating to obstacles'
+                })
+        
+        elif command == 'stop':
+            mission_active = False
+            stop_motors()
+            logger.info("🛑 MISSION STOPPED")
+            if sio.connected:
+                sio.emit('mission_status_update', {
+                    'status': 'stopped',
+                    'message': 'Mission stopped by user'
+                })
+        
+        elif command == 'return':
+            # Return to start command from dashboard
+            logger.info("🏁 RETURN TO START command received from dashboard")
+            mission_active = False
+            stop_motors()
+            time.sleep(0.5)
+            emergency_return_to_start()
+            
+            if sio.connected:
+                sio.emit('mission_status_update', {
+                    'status': 'returned',
+                    'message': 'ASV returned to START position'
+                })
+        
+        elif command == 'abort':
+            # Emergency abort
+            logger.warning("⚠️ EMERGENCY ABORT from dashboard")
+            mission_active = False
+            stop_motors()
+            
+            if sio.connected:
+                sio.emit('mission_status_update', {
+                    'status': 'aborted',
+                    'message': 'Mission aborted - motors stopped'
+                })
+
 def connect_to_server_background(backoff_base=1.0, max_backoff=30.0):
-    """Background thread to connect to Socket.IO with backoff and stop_event support."""
     attempt = 0
     while not stop_event.is_set():
         try:
             if sio.connected:
-                logger.info("Socket.IO already connected")
                 return
             attempt += 1
-            logger.info(f"🔌 Attempting Socket.IO connect (attempt {attempt}) to {SOCKETIO_SERVER}")
+            logger.info(f"🔌 Connecting (attempt {attempt})...")
             sio.connect(SOCKETIO_SERVER, wait=True, transports=['websocket'])
-            logger.info("🔌 Connected to Socket.IO server")
             return
         except Exception as e:
             wait = min(max_backoff, backoff_base * (2 ** (attempt - 1)))
-            logger.warning(f"⚠️ Socket.IO connect failed ({e}). Retrying in {wait:.1f}s")
+            logger.warning(f"⚠️ Failed: {e}. Retry in {wait}s")
             if stop_event.wait(wait):
                 break
 
-# Handler untuk menerima command dari dashboard
-@sio.event
-def mission_command(data):
-    """Handle mission commands from dashboard"""
-    global mission_sm, mission_active
+# ========== MOTOR CONTROL ==========
+def init_motors():
+    global pwm_left_gpio, pwm_right_gpio
+    if not GPIO_AVAILABLE:
+        logger.warning("⚠️ GPIO not available")
+        return False
     
-    command = data.get('command')
-    logger.info(f"📥 Received mission_command: {command}")
-    
-    if command == 'start':
-        # Activate mission (enable motor control)
-        with mission_control_lock:
-            mission_active = True
+    try:
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
+        GPIO.setup(MOTOR_LEFT_GPIO, GPIO.OUT)
+        GPIO.setup(MOTOR_RIGHT_GPIO, GPIO.OUT)
         
-        if mission_sm and mission_sm.state == MissionState.IDLE:
-            mission_sm.start()
-            logger.info("🚀 Mission STARTED!")
-            logger.info("🚧 Obstacle detection: ENABLED")
-            logger.info("📷 Auto photo capture: ENABLED")
-            logger.info("⚡ Motor control: ENABLED")
-            sio.emit('mission_status_update', {
-                'state': 'NAVIGATING',
-                'status': '🚀 Mission Started',
-                'message': 'ASV mulai navigasi autonomous ke Gate 1'
-            })
-        else:
-            logger.warning("Mission already running or not initialized")
-    
-    elif command == 'stop':
-        # Deactivate mission (disable motor control)
-        with mission_control_lock:
-            mission_active = False
+        pwm_left_gpio = GPIO.PWM(MOTOR_LEFT_GPIO, PWM_FREQ_GPIO)
+        pwm_right_gpio = GPIO.PWM(MOTOR_RIGHT_GPIO, PWM_FREQ_GPIO)
         
-        # Stop motors immediately
-        stop_motors()
+        pwm_left_gpio.start(7.5)
+        pwm_right_gpio.start(7.5)
         
-        if mission_sm:
-            mission_sm.stop()
-            logger.info("🛑 Mission STOPPED")
-            logger.info("⚡ Motor control: DISABLED")
-            sio.emit('mission_status_update', {
-                'state': 'IDLE',
-                'status': '🛑 Mission Stopped',
-                'message': 'ASV standby - motor disabled'
-            })
-    
-    elif command == 'abort':
-        # Emergency abort
-        with mission_control_lock:
-            mission_active = False
-        
-        # Stop motors immediately
-        stop_motors()
-        
-        reason = data.get('reason', 'Manual abort from dashboard')
-        if mission_sm:
-            mission_sm.abort(reason)
-            logger.warning(f"⚠️ Mission ABORTED: {reason}")
-            sio.emit('mission_status_update', {
-                'state': 'ABORTED',
-                'status': '⚠️ Mission Aborted',
-                'message': reason
-            })
-
-# ========== PIXHAWK CONNECTION ==========
-def connect_pixhawk():
-    global mavlink_connection
-    if not MAVLINK_AVAILABLE:
+        logger.info("✅ Motors initialized")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Motor init: {e}")
         return False
 
-    for port in PIXHAWK_PORTS:
-        try:
-            logger.info(f"   Trying {port}...")
-            connection = mavutil.mavlink_connection(port, baud=PIXHAWK_BAUD)
-            connection.wait_heartbeat(timeout=5)
-            mavlink_connection = connection
-            logger.info(f"✅ Pixhawk connected on {port}")
-            return True
-        except Exception:
-            continue
+def set_motor(pwm, speed_percent):
+    """
+    Set motor speed (FORWARD ONLY motors)
+    speed_percent: 0-100 (ONLY positive values)
+    """
+    if pwm:
+        # For FORWARD-ONLY motors: 0% = stop (7.5%), 100% = full forward (10%)
+        # NO REVERSE! ESC tidak support reverse
+        speed_percent = max(0, min(100, speed_percent))  # Clamp to 0-100
+        duty = 7.5 + (speed_percent / 100.0) * 2.5  # 7.5% (stop) to 10% (full)
+        pwm.ChangeDutyCycle(duty)
 
-    logger.warning("⚠️ Pixhawk not found - GPS dummy mode")
-    return False
+def stop_motors():
+    set_motor(pwm_left_gpio, 0)
+    set_motor(pwm_right_gpio, 0)
 
-# ========== GPS DATA ==========
-def generate_dummy_gps_data():
-    base_lat = -5.3972
-    base_lon = 105.2668
-    lat = base_lat + random.uniform(-0.0001, 0.0001)
-    lon = base_lon + random.uniform(-0.0001, 0.0001)
-    now = datetime.utcnow()
-    speed_knot = random.uniform(0, 2.5)
-    heading = random.randint(0, 359)
-    battery = random.randint(85, 100)
-
-    return {
-        'Day': now.strftime('%A'),
-        'Date': now.strftime('%Y-%m-%d'),
-        'Time': now.strftime('%H:%M:%S'),
-        'Latitude_DD': f"{lat:.6f}",
-        'Longitude_DD': f"{lon:.6f}",
-        'Latitude_DM': f"5°23.{random.randint(800,900)}'S",
-        'Longitude_DM': f"105°16.{random.randint(0,99):02d}'E",
-        'SOG_knot': f"{speed_knot:.2f}",
-        'SOG_kmh': f"{speed_knot * 1.852:.2f}",
-        'COG_deg': f"{heading}",
-        'Pitch': f"{random.uniform(-5, 5):.2f}",
-        'Roll': f"{random.uniform(-5, 5):.2f}",
-        'Battery_': f"{battery}",
-        'Mission_Status': mission_status
-    }
-
-def read_gps_data():
-    global latest_gps_data, current_heading, mavlink_connection, gps_data_event
-
-    if not mavlink_connection:
-        # Dummy GPS - responsive to stop_event
-        while not stop_event.is_set():
-            with gps_data_lock:
-                latest_gps_data = generate_dummy_gps_data()
-            gps_data_event.set()
-            if stop_event.wait(1.0):
-                break
-        return
-
-    # Real Pixhawk GPS - INITIALIZE data structure first
-    logger.info("📡 Reading GPS data from Pixhawk...")
+def drive(throttle, steering):
+    """
+    Differential drive for FORWARD-ONLY motors
+    throttle: 0-100 (base speed, ALWAYS positive)
+    steering: -100 (left) to +100 (right)
     
-    with gps_data_lock:
-        # Initialize with default values
-        now = datetime.utcnow()
-        latest_gps_data = {
-            'Day': now.strftime('%A'),
-            'Date': now.strftime('%Y-%m-%d'),
-            'Time': now.strftime('%H:%M:%S'),
-            'Latitude_DD': '0.000000',
-            'Longitude_DD': '0.000000',
-            'Latitude_DM': "0°00.000'N",
-            'Longitude_DM': "0°00.000'E",
-            'SOG_knot': '0.00',
-            'SOG_kmh': '0.00',
-            'COG_deg': '0',
-            'Pitch': '0.00',
-            'Roll': '0.00',
-            'Battery_': '0',
-            'Mission_Status': mission_status
-        }
-
-    while not stop_event.is_set():
-        try:
-            msg = mavlink_connection.recv_match(blocking=False)
-            if msg:
-                msg_type = msg.get_type()
-
-                # Update timestamp on every message
-                now = datetime.utcnow()
-
-                if msg_type == "GLOBAL_POSITION_INT":
-                    lat = msg.lat / 1e7
-                    lon = msg.lon / 1e7
-                    
-                    # Convert to DM format
-                    lat_dm = f"{abs(int(lat))}°{abs((lat - int(lat)) * 60):.3f}'" + ("N" if lat >= 0 else "S")
-                    lon_dm = f"{abs(int(lon))}°{abs((lon - int(lon)) * 60):.3f}'" + ("E" if lon >= 0 else "W")
-                    
-                    with gps_data_lock:
-                        latest_gps_data['Latitude_DD'] = f"{lat:.6f}"
-                        latest_gps_data['Longitude_DD'] = f"{lon:.6f}"
-                        latest_gps_data['Latitude_DM'] = lat_dm
-                        latest_gps_data['Longitude_DM'] = lon_dm
-                        latest_gps_data['Date'] = now.strftime('%Y-%m-%d')
-                        latest_gps_data['Time'] = now.strftime('%H:%M:%S')
-                        latest_gps_data['Day'] = now.strftime('%A')
-
-                elif msg_type == "VFR_HUD":
-                    current_heading = msg.heading
-                    speed_ms = msg.groundspeed  # m/s
-                    speed_knot = speed_ms * 1.94384
-                    speed_kmh = speed_ms * 3.6
-                    
-                    with gps_data_lock:
-                        latest_gps_data['SOG_knot'] = f"{speed_knot:.2f}"
-                        latest_gps_data['SOG_kmh'] = f"{speed_kmh:.2f}"
-                        latest_gps_data['COG_deg'] = f"{int(msg.heading)}"
-
-                elif msg_type == "ATTITUDE":
-                    pitch_deg = math.degrees(msg.pitch)
-                    roll_deg = math.degrees(msg.roll)
-                    
-                    with gps_data_lock:
-                        latest_gps_data['Pitch'] = f"{pitch_deg:.2f}"
-                        latest_gps_data['Roll'] = f"{roll_deg:.2f}"
-
-                elif msg_type == "SYS_STATUS":
-                    battery_percent = msg.battery_remaining
-                    
-                    with gps_data_lock:
-                        latest_gps_data['Battery_'] = f"{battery_percent}"
-
-                # Always update mission status and time
-                with gps_data_lock:
-                    latest_gps_data['Mission_Status'] = mission_status
-                    latest_gps_data['Time'] = now.strftime('%H:%M:%S')
-
-            gps_data_event.set()
-            if stop_event.wait(0.1):
-                break
-                
-        except Exception as e:
-            logger.warning(f"⚠️ GPS error: {e}")
-            if stop_event.wait(1.0):
-                break
-
-    logger.info("GPS thread stopped")
-
-def send_dashboard_update():
-    global data_send_count
-    while not stop_event.is_set():
-        try:
-            gps_data_event.wait(timeout=1.0)
-            gps_data_event.clear()
-
-            with gps_data_lock:
-                if sio.connected and latest_gps_data:
-                    sio.emit('update_dashboard', latest_gps_data)
-                    data_send_count += 1
-                    if data_send_count % 10 == 0:
-                        logger.info(f"📡 Sent {data_send_count} GPS updates")
-
-            if stop_event.wait(SEND_INTERVAL):
-                break
-        except Exception as e:
-            logger.error(f"⚠️ Dashboard update error: {e}")
-            if stop_event.wait(1.0):
-                break
-
-# ========== CAMERA INITIALIZATION ==========
-def init_dual_cameras():
-    """Initialize both cameras: navigation (Logitech) and underwater (Brica PRO)"""
-    global camera_nav, camera_underwater
-
-    # Initialize navigation camera (Logitech)
-    try:
-        cam_nav = cv2.VideoCapture(CAMERA_NAVIGATION)
-        if cam_nav.isOpened():
-            cam_nav.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-            cam_nav.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-            cam_nav.set(cv2.CAP_PROP_FPS, 30)
-            ret, _ = cam_nav.read()
-            if ret:
-                camera_nav = cam_nav
-                logger.info(f"✅ Navigation Camera (index {CAMERA_NAVIGATION}) initialized")
-            else:
-                cam_nav.release()
-                logger.error("❌ Navigation camera read failed")
-        else:
-            logger.error("❌ Cannot open navigation camera")
-    except Exception as e:
-        logger.exception(f"❌ Navigation camera error: {e}")
-
-    # Initialize underwater camera (Brica PRO)
-    try:
-        if USE_BRICA_WIFI:
-            logger.info(f"   Trying Brica PRO WiFi stream: {BRICA_WIFI_STREAM}")
-            cam_under = cv2.VideoCapture(BRICA_WIFI_STREAM)
-        else:
-            logger.info(f"   Trying Brica PRO USB mode: index {CAMERA_UNDERWATER}")
-            cam_under = cv2.VideoCapture(CAMERA_UNDERWATER)
-
-        if cam_under.isOpened():
-            cam_under.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-            cam_under.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-            cam_under.set(cv2.CAP_PROP_FPS, 30)
-            ret, test_frame = cam_under.read()
-            if ret:
-                camera_underwater = cam_under
-                mode = "WiFi" if USE_BRICA_WIFI else "USB"
-                logger.info(f"✅ Underwater Camera (Brica PRO {mode}) initialized")
-            else:
-                cam_under.release()
-                logger.warning("⚠️ Brica PRO read failed (optional)")
-        else:
-            logger.warning("⚠️ Cannot open Brica PRO (optional)")
-    except Exception as e:
-        logger.exception(f"⚠️ Brica PRO error (optional): {e}")
-
-    return camera_nav is not None
+    Strategy untuk belok tanpa reverse:
+    - Belok kiri: motor kanan full, motor kiri slow/stop
+    - Belok kanan: motor kiri full, motor kanan slow/stop
+    """
+    # Ensure throttle is positive (forward only)
+    throttle = max(0, min(100, abs(throttle)))
+    
+    if steering < 0:  # Turn LEFT
+        # Motor kanan cepat, motor kiri lambat
+        left = throttle * (1 + steering / 100.0)  # Reduce left motor
+        right = throttle  # Right motor full
+    elif steering > 0:  # Turn RIGHT
+        # Motor kiri cepat, motor kanan lambat
+        left = throttle  # Left motor full
+        right = throttle * (1 - steering / 100.0)  # Reduce right motor
+    else:  # STRAIGHT
+        left = throttle
+        right = throttle
+    
+    # Clamp to 0-100 (NO NEGATIVE values!)
+    left = max(0, min(100, left))
+    right = max(0, min(100, right))
+    
+    set_motor(pwm_left_gpio, left)
+    set_motor(pwm_right_gpio, right)
+    
+    logger.debug(f"🚢 Drive: T={throttle}%, S={steering}% | L={left:.0f}% R={right:.0f}%")
 
 # ========== BALL DETECTION ==========
-def detect_ball(frame_bgr, lower, upper, lower2=None, upper2=None):
-    """
-    Detect ball with COLOR + SHAPE filtering
-    Returns: {'x', 'y', 'radius', 'circularity'} or None
-    """
-    blurred = cv2.GaussianBlur(frame_bgr, (7, 7), 0)
-    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+def detect_ball(frame, lower, upper, lower2=None, upper2=None):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    blurred = cv2.GaussianBlur(hsv, (7, 7), 0)
     
-    if lower2 is not None and upper2 is not None:
-        mask = cv2.bitwise_or(cv2.inRange(hsv, lower, upper), cv2.inRange(hsv, lower2, upper2))
+    if lower2 is not None:
+        mask = cv2.bitwise_or(
+            cv2.inRange(blurred, lower, upper),
+            cv2.inRange(blurred, lower2, upper2)
+        )
     else:
-        mask = cv2.inRange(hsv, lower, upper)
+        mask = cv2.inRange(blurred, lower, upper)
     
     kernel = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -554,886 +266,486 @@ def detect_ball(frame_bgr, lower, upper, lower2=None, upper2=None):
     
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # BEST BALL SELECTION: Filter by circularity + size
     best_ball = None
     best_score = 0
     
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < 500:  # Min area
+        if area < 400:
             continue
         
-        # Calculate circularity
         perimeter = cv2.arcLength(contour, True)
         if perimeter == 0:
             continue
-        circularity = 4 * math.pi * area / (perimeter * perimeter)
         
-        # Get enclosing circle
+        circularity = 4 * math.pi * area / (perimeter * perimeter)
         ((x, y), radius) = cv2.minEnclosingCircle(contour)
         
-        # Validate: radius + circularity
-        if radius < MIN_BALL_RADIUS:
+        if radius < MIN_BALL_RADIUS or circularity < MIN_CIRCULARITY:
             continue
         
-        if circularity < MIN_CIRCULARITY:
-            logger.debug(f"   Rejected: circularity {circularity:.2f} < {MIN_CIRCULARITY}")
-            continue
-        
-        # Score: circularity * area (prefer circular + large objects)
         score = circularity * area
         
         if score > best_score:
             best_score = score
-            best_ball = {
-                'x': int(x),
-                'y': int(y),
-                'radius': int(radius),
-                'circularity': round(circularity, 2),
-                'area': int(area)
-            }
+            best_ball = {'x': int(x), 'y': int(y), 'radius': int(radius)}
     
     return best_ball
 
-def calculate_navigation(red_ball, green_ball):
-    """Calculate navigation with gate position validation"""
+def validate_gate(red_ball, green_ball):
     if not (red_ball and green_ball):
-        return None, None, None, None
+        return False, None, None
     
-    # Calculate distance between red and green ball
     dx = red_ball['x'] - green_ball['x']
     dy = red_ball['y'] - green_ball['y']
-    ball_distance = math.sqrt(dx**2 + dy**2)
+    distance_px = math.sqrt(dx**2 + dy**2)
     
-    # Validate: balls harus berdekatan tapi tidak terlalu dekat/jauh
-    if ball_distance < MIN_BALL_SEPARATION:
-        logger.debug(f"⚠️ Balls too close: {ball_distance:.1f}px (min: {MIN_BALL_SEPARATION})")
-        return None, None, None, None
+    if distance_px < MIN_BALL_SEPARATION or distance_px > MAX_BALL_SEPARATION:
+        return False, None, None
     
-    if ball_distance > MAX_BALL_SEPARATION:
-        logger.debug(f"⚠️ Balls too far: {ball_distance:.1f}px (max: {MAX_BALL_SEPARATION})")
-        return None, None, None, None
+    if red_ball['x'] <= green_ball['x']:
+        logger.warning(f"⚠️ Gate wrong: RED={red_ball['x']}, GREEN={green_ball['x']}")
     
-    # Determine gate position (red-green or green-red)
-    if red_ball['x'] < green_ball['x']:
-        gate_type = "RED_LEFT_GREEN_RIGHT"
-    else:
-        gate_type = "GREEN_LEFT_RED_RIGHT"
-    
-    # Calculate midpoint (RAW - belum diratakan)
     mid_x = (red_ball['x'] + green_ball['x']) / 2
-    mid_y = (red_ball['y'] + green_ball['y']) / 2
+    avg_radius = (red_ball['radius'] + green_ball['radius']) / 2
+    distance = 600.0 / avg_radius if avg_radius > 0 else 999
     
-    # Calculate heading adjustment
-    offset_x = mid_x - CAMERA_WIDTH / 2
-    heading_adj = (offset_x / CAMERA_WIDTH) * 60
-    heading_adj = max(-30, min(30, heading_adj))
-    
-    return mid_x, mid_y, heading_adj, gate_type
+    return True, mid_x, distance
 
-# ========== PHOTO CAPTURE & SAVE ==========
-def save_and_emit_photo(frame, capture_type: str, gate_index: int):
-    """Save photo to disk and emit to dashboard"""
+def navigate_to_gate(mid_x, distance):
+    offset = mid_x - (CAMERA_WIDTH / 2)
+    steering = (offset / (CAMERA_WIDTH / 2)) * 100
+    steering = max(-100, min(100, steering))
+    
+    if abs(offset) > 120:
+        throttle = BASE_SPEED * TURN_SPEED
+    elif abs(offset) > 60:
+        throttle = BASE_SPEED * 0.85
+    else:
+        throttle = BASE_SPEED
+    
+    if distance < 3.5:
+        throttle *= 0.6
+    elif distance < 5.0:
+        throttle *= 0.75
+    
+    drive(throttle, steering)
+    logger.info(f"🎯 offset={offset:.0f}px, dist={distance:.1f}m")
+    return abs(offset) < OFFSET_THRESHOLD
+
+# ========== SEGMENT TRANSITION ==========
+def move_to_next_segment():
+    global current_segment, obstacles_in_segment
+    
+    current_segment += 1
+    obstacles_in_segment = 0
+    
+    logger.info(f"🔄 SEGMENT {current_segment + 1}")
+    
+    # Lateral movement LEFT (for FORWARD-ONLY motors)
+    # Strategy: Motor kanan ON, motor kiri OFF/SLOW → belok kiri sambil maju
+    logger.info("   Lateral LEFT...")
+    drive(40, -80)  # Throttle 40%, steering LEFT 80%
+    time.sleep(8.0)
+    
+    stop_motors()
+    time.sleep(1.0)
+    
+    # Sweep for obstacles (rotate in place)
+    logger.info("   Sweeping...")
+    for _ in range(3):
+        drive(30, 70)  # Slow forward + right turn
+        time.sleep(1.5)
+        stop_motors()
+        time.sleep(0.5)
+    
+    logger.info(f"✅ Ready SEGMENT {current_segment + 1}")
+
+def return_to_start():
+    """
+    Return to START (MODIFIED for FORWARD-ONLY motors)
+    Strategy: Turn around (pivot) then go straight
+    """
+    logger.info("🏁 Returning to START...")
+    
+    # Turn around (180 degrees) - pivot turn
+    logger.info("   Turning around...")
+    drive(35, 100)  # Slow forward + full right turn (pivot)
+    time.sleep(6.0)  # Adjust timing for 180° turn
+    
+    stop_motors()
+    time.sleep(1.0)
+    
+    # Go straight to START area
+    logger.info("   Going to START...")
+    drive(60, 0)  # Straight forward
+    time.sleep(10.0)
+    
+    stop_motors()
+    logger.info("🏁 ARRIVED!")
+
+def emergency_return_to_start():
+    """
+    Emergency return (MODIFIED for FORWARD-ONLY motors)
+    NO REVERSE! Only forward + turning
+    """
+    logger.warning("🚨 EMERGENCY RETURN TO START!")
+    
+    stop_motors()
+    time.sleep(1.0)
+    
+    # Turn around (180 degrees) using pivot turn
+    logger.info("   Emergency turn around...")
+    drive(40, 100)  # Slow forward + full right turn
+    time.sleep(7.0)  # Time for 180° turn
+    
+    stop_motors()
+    time.sleep(1.0)
+    
+    # Move forward to START area
+    logger.info("   Moving to START...")
+    drive(70, 0)  # Straight forward, faster
+    time.sleep(12.0)
+    
+    stop_motors()
+    logger.info("🏁 EMERGENCY RETURN COMPLETE!")
+    logger.info("   Please check system and restart mission")
+
+# ========== PHOTO CAPTURE ==========
+def capture_photo(frame, num):
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"gate{gate_index}_{capture_type}_{timestamp}.jpg"
+        filename = f"obstacle{num:02d}_{timestamp}.jpg"
         filepath = f"captures/{filename}"
-
-        # Create captures directory if not exists
+        
         os.makedirs("captures", exist_ok=True)
-
-        # Save to disk
         cv2.imwrite(filepath, frame)
-        logger.info(f"💾 Saved {filepath}")
-
-        # Encode and emit to dashboard
-        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        jpg_base64 = base64.b64encode(buffer).decode('utf-8')
-
+        logger.info(f"📸 {filename}")
+        
         if sio.connected:
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            jpg_base64 = base64.b64encode(buffer).decode('utf-8')
             sio.emit('photo_captured', {
-                'type': capture_type,
-                'gate': gate_index,
+                'type': 'surface',
+                'obstacle': num,
                 'filename': filename,
                 'image': jpg_base64,
                 'timestamp': timestamp
             })
     except Exception as e:
-        logger.error(f"❌ save_and_emit_photo error: {e}")
+        logger.error(f"❌ Photo: {e}")
 
-# ========== CALLBACK IMPLEMENTATIONS =========
-def on_capture_callback(capture_type: str, gate_index: int):
-    """Called by state machine to capture photo"""
-    logger.info(f"📸 Capture {capture_type} at gate {gate_index}")
-
-    if capture_type == "surface":
-        with frame_lock:
-            if latest_frame is None:
-                logger.warning("No frame available for surface capture")
-                return
-            frame_copy = latest_frame.copy()
-        save_and_emit_photo(frame_copy, capture_type="surface", gate_index=gate_index)
-
-    elif capture_type == "underwater":
-        if camera_underwater and camera_underwater.isOpened():
-            ret, frame = camera_underwater.read()
-            if ret:
-                save_and_emit_photo(frame, capture_type="underwater", gate_index=gate_index)
-            else:
-                logger.warning("Underwater camera read failed")
-        else:
-            logger.warning("Underwater camera not available")
-
-def on_lower_callback(gate_index: int):
-    """Called by state machine to lower underwater camera"""
-    logger.info(f"⬇️ Lower camera at gate {gate_index}")
-    if sio.connected:
-        sio.emit('mission_event', {'event': 'lower_camera', 'gate': gate_index})
-
-def on_raise_callback(gate_index: int):
-    """Called by state machine to raise underwater camera"""
-    logger.info(f"⬆️ Raise camera at gate {gate_index}")
-    if sio.connected:
-        sio.emit('mission_event', {'event': 'raise_camera', 'gate': gate_index})
-
-def on_navigate_callback(target: Tuple[float, float]):
-    """Called by state machine to navigate to waypoint"""
-    lat, lon = target
-    logger.info(f"🧭 Navigate to ({lat:.6f}, {lon:.6f})")
-
-def on_emit_event(event_name: str, payload: dict):
-    """Called by state machine to emit mission events to dashboard"""
-    logger.info(f"📡 Event: {event_name} → {payload}")
-    if sio.connected:
-        sio.emit('mission_event', {'event': event_name, **payload})
-
-# ========== TELEMETRY FORWARDER =========
-def telemetry_forwarder():
-    """Thread: forward GPS telemetry to state machine"""
-    global mission_sm
-    logger.info("Telemetry forwarder started")
-
-    while not stop_event.is_set():
-        try:
-            with gps_data_lock:
-                lat = latest_gps_data.get('Latitude_DD')
-                lon = latest_gps_data.get('Longitude_DD')
-                sog_str = latest_gps_data.get('SOG_knot', '0')
-                cog_str = latest_gps_data.get('COG_deg', '0')
-
-            if mission_sm:
-                # Update position
-                if lat and lon:
-                    try:
-                        latf = float(lat)
-                        lonf = float(lon)
-                        mission_sm.update_position(latf, lonf)
-                    except Exception:
-                        pass
-
-                # Update speed (knot → m/s)
-                try:
-                    speed_kn = float(sog_str)
-                    speed_ms = speed_kn * 0.514444
-                    mission_sm.update_speed(speed_ms)
-                except Exception:
-                    pass
-
-                # Update heading
-                try:
-                    heading_val = float(cog_str)
-                    mission_sm.update_heading(heading_val)
-                except Exception:
-                    pass
-        except Exception:
-            logger.exception("Telemetry forwarder error")
-
-        if stop_event.wait(0.5):
-            break
-
-# ========== MOTOR CONTROL (GPIO Direct!) ==========
-pwm_left_gpio = None
-pwm_right_gpio = None
-
-def init_gpio_motors():
-    """Initialize GPIO motor control (bypass Pixhawk)"""
-    global pwm_left_gpio, pwm_right_gpio
+# ========== MAIN MISSION LOOP ==========
+def mission_loop_lintasan_a():
+    global latest_frame, mission_active
+    global current_segment, obstacles_in_segment, total_obstacles_passed
     
-    if not GPIO_AVAILABLE:
-        logger.warning("⚠️ GPIO not available for motor control")
-        return False
+    logger.info("🚀 LINTASAN-A Started")
+    logger.info(f"   Emergency return: {'ENABLED' if EMERGENCY_RETURN_ENABLED else 'DISABLED'}")
     
-    try:
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(MOTOR_LEFT_GPIO, GPIO.OUT)
-        GPIO.setup(MOTOR_RIGHT_GPIO, GPIO.OUT)
-        
-        pwm_left_gpio = GPIO.PWM(MOTOR_LEFT_GPIO, PWM_FREQ_GPIO)
-        pwm_right_gpio = GPIO.PWM(MOTOR_RIGHT_GPIO, PWM_FREQ_GPIO)
-        
-        # Start at neutral (1500µs = 7.5% duty cycle)
-        pwm_left_gpio.start(7.5)
-        pwm_right_gpio.start(7.5)
-        
-        logger.info("✅ GPIO motor control initialized")
-        logger.info(f"   Motor Left: GPIO {MOTOR_LEFT_GPIO}")
-        logger.info(f"   Motor Right: GPIO {MOTOR_RIGHT_GPIO}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ GPIO motor init error: {e}")
-        return False
-
-def set_motor_left(speed_percent):
-    """Control left motor via GPIO (direct ESC control)"""
-    if not GPIO_AVAILABLE or pwm_left_gpio is None:
-        logger.debug(f"Motor Left: {speed_percent}% (GPIO not available)")
-        return
-    
-    try:
-        duty_cycle = 7.5 + (speed_percent / 100.0) * 2.5
-        duty_cycle = max(5.0, min(10.0, duty_cycle))
-        pwm_left_gpio.ChangeDutyCycle(duty_cycle)
-        logger.debug(f"⚡ Motor LEFT: {speed_percent}% → {duty_cycle:.2f}% duty")
-    except Exception as e:
-        logger.error(f"❌ Motor left error: {e}")
-
-def set_motor_right(speed_percent):
-    """Control right motor via GPIO (direct ESC control)"""
-    if not GPIO_AVAILABLE or pwm_right_gpio is None:
-        logger.debug(f"Motor Right: {speed_percent}% (GPIO not available)")
-        return
-    
-    try:
-        duty_cycle = 7.5 + (speed_percent / 100.0) * 2.5
-        duty_cycle = max(5.0, min(10.0, duty_cycle))
-        pwm_right_gpio.ChangeDutyCycle(duty_cycle)
-        logger.debug(f"⚡ Motor RIGHT: {speed_percent}% → {duty_cycle:.2f}% duty")
-    except Exception as e:
-        logger.error(f"❌ Motor right error: {e}")
-
-def set_differential_drive(throttle_percent, steering_percent):
-    """Control differential drive (2 motors)"""
-    try:
-        if steering_percent < 0:
-            left_speed = throttle_percent * (1 + steering_percent / 100.0)
-            right_speed = throttle_percent
-        elif steering_percent > 0:
-            left_speed = throttle_percent
-            right_speed = throttle_percent * (1 - steering_percent / 100.0)
-        else:
-            left_speed = throttle_percent
-            right_speed = throttle_percent
-        
-        left_speed = max(-100, min(100, left_speed))
-        right_speed = max(-100, min(100, right_speed))
-        
-        set_motor_left(left_speed)
-        set_motor_right(right_speed)
-        
-        logger.debug(f"🚢 Diff: T={throttle_percent}% S={steering_percent}% | L={left_speed:.1f}% R={right_speed:.1f}%")
-    except Exception as e:
-        logger.error(f"❌ Differential drive error: {e}")
-        stop_motors()
-
-def stop_motors():
-    """Emergency stop all motors"""
-    set_motor_left(0)
-    set_motor_right(0)
-    logger.info("🛑 Motors stopped")
-
-def navigate_to_gate_center(mid_x, heading_adj):
-    """Navigate ASV to center of gate using differential drive"""
-    global mission_active
-    
-    with mission_control_lock:
-        if not mission_active:
-            logger.debug("Navigation skipped - mission not active")
-            return False
-    
-    try:
-        offset_from_center = mid_x - (CAMERA_WIDTH / 2)
-        steering_percent = (offset_from_center / (CAMERA_WIDTH / 2)) * 100
-        steering_percent = max(-100, min(100, steering_percent))
-        
-        if abs(steering_percent) > 50:
-            throttle_percent = 30
-        elif abs(steering_percent) > 20:
-            throttle_percent = 50
-        else:
-            throttle_percent = 70
-        
-        set_differential_drive(throttle_percent, steering_percent)
-        
-        logger.info(f"🚢 Navigate: Offset={offset_from_center:.1f}px | Steering={steering_percent:.1f}%")
-        
-        if abs(offset_from_center) < OFFSET_THRESHOLD:
-            logger.info("✅ Gate centered!")
-            set_differential_drive(80, 0)
-            return True
-        
-        return False
-    except Exception as e:
-        logger.error(f"❌ Navigation error: {e}")
-        stop_motors()
-        return False
-
-# ========== CAMERA STREAM LOOP ==========
-def camera_stream_loop():
-    """Main camera streaming loop with obstacle detection"""
-    global latest_frame, latest_obstacles, mission_active, last_underwater_photo_time
-
-    if not camera_nav:
-        logger.error("❌ No camera available")
-        return
-
-    last_send_time = 0
-    last_obstacle_send = 0
-    frame_count = 0
-    OBSTACLE_SEND_INTERVAL = 2.0
-    
-    # Gate detection state
-    last_gate_detection_time = 0
-    GATE_DETECTION_COOLDOWN = 3.0
-    
-    # Gate navigation state
-    gate_centered = False
-    gate_passed = False
-    current_gate_index = 0
-    
-    # Midpoint smoothing (NEW! - untuk stabilkan deteksi)
     mid_history = []
-    max_history = 5  # Rata-rata dari 5 frame terakhir
-
-    # Docking state
-    docking_mode = False
-    docked = False
-
+    last_obstacle_time = 0
+    no_detection_count = 0
+    frame_count = 0
+    
+    # Emergency tracking
+    last_gate_seen_time = time.time()
+    obstacle_start_time = None
+    last_obstacle_distance = None
+    
     while not stop_event.is_set():
         try:
             ret, frame = camera_nav.read()
             if not ret:
-                logger.warning("⚠️ Camera read failed")
                 time.sleep(0.1)
                 continue
-
-            # Store frame for capture callbacks
+            
             with frame_lock:
                 latest_frame = frame.copy()
-
-            # Create clean frame for web display (NO OVERLAY!)
-            clean_frame = frame.copy()
-
-            # ========== OBSTACLE DETECTION ==========
-            obstacles = detect_obstacles(frame)
-            with obstacle_lock:
-                latest_obstacles = obstacles
-
-            # ========== BALL DETECTION & AUTO-NAVIGATION ==========
-            current_time = time.time()
             
-            # Only detect gate if cooldown expired
-            if current_time - last_gate_detection_time > GATE_DETECTION_COOLDOWN:
-                red_ball = detect_ball(frame, RED_LOWER1, RED_UPPER1, RED_LOWER2, RED_UPPER2)
-                green_ball = detect_ball(frame, GREEN_LOWER, GREEN_UPPER)
-                blue_ball = detect_ball(frame, BLUE_LOWER, BLUE_UPPER)
-
-                # Calculate navigation (RAW midpoint)
-                mid_x_raw, mid_y, heading_adj, gate_type = calculate_navigation(red_ball, green_ball)
+            with mission_lock:
+                is_active = mission_active
+            
+            if not is_active:
+                if sio.connected and frame_count % 3 == 0:
+                    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                    jpg_base64 = base64.b64encode(buffer).decode('utf-8')
+                    sio.emit('video_frame', {'image': jpg_base64})
                 
-                # Smoothing midpoint dengan history buffer (NEW!)
-                if mid_x_raw is not None:
-                    # Tambah ke history
-                    mid_history.append(mid_x_raw)
-                    
-                    # Keep only last N frames
-                    if len(mid_history) > max_history:
-                        mid_history.pop(0)
-                    
-                    # Calculate averaged midpoint (smooth!)
-                    mid_x = sum(mid_history) / len(mid_history)
-                    
-                    logger.debug(f"Midpoint: raw={mid_x_raw:.1f}, smoothed={mid_x:.1f}, history={len(mid_history)}")
-                else:
-                    # No gate detected, clear history
-                    mid_history = []
-                    mid_x = None
+                frame_count += 1
+                time.sleep(0.1)
+                continue
+            
+            # ACTIVE MISSION
+            red_ball = detect_ball(frame, RED_LOWER1, RED_UPPER1, RED_LOWER2, RED_UPPER2)
+            green_ball = detect_ball(frame, GREEN_LOWER, GREEN_UPPER)
+            
+            gate_valid, mid_x_raw, distance = validate_gate(red_ball, green_ball)
+            
+            if not gate_valid:
+                no_detection_count += 1
                 
-                if mid_x is not None and gate_type is not None:
-                    with mission_control_lock:
-                        is_mission_active = mission_active
-                    
-                    if is_mission_active and not gate_passed:
-                        # Use SMOOTHED midpoint for navigation!
-                        gate_centered = navigate_to_gate_center(mid_x, heading_adj)
-                    
-                    # Check if gate passed
-                    if red_ball and green_ball:
-                        avg_radius = (red_ball['radius'] + green_ball['radius']) / 2
-                        estimated_distance = (FOCAL_LENGTH * 0.1) / avg_radius if avg_radius > 0 else 999
+                # === EMERGENCY CHECK 1: No gate detected for too long ===
+                if EMERGENCY_RETURN_ENABLED:
+                    time_since_last_gate = time.time() - last_gate_seen_time
+                    if time_since_last_gate > MAX_NO_GATE_TIME:
+                        logger.error(f"🚨 EMERGENCY: No gate for {time_since_last_gate:.0f}s!")
+                        emergency_return_to_start()
                         
-                        if estimated_distance < 3.0 and is_mission_active:
-                            last_gate_detection_time = current_time
-                            gate_passed = True
-                            current_gate_index += 1
+                        with mission_lock:
+                            mission_active = False
+                        
+                        if sio.connected:
+                            sio.emit('emergency_abort', {
+                                'reason': 'No gate detected for too long',
+                                'time': time_since_last_gate,
+                                'timestamp': datetime.now().isoformat()
+                            })
+                        
+                        break
+                
+                if no_detection_count > 30:
+                    logger.warning("⚠️ Sweeping...")
+                    drive(0, 30)
+                    time.sleep(0.5)
+                    no_detection_count = 0
+                
+                stop_motors()
+                time.sleep(0.05)
+                continue
+            
+            # Gate detected - reset timer
+            last_gate_seen_time = time.time()
+            no_detection_count = 0
+            
+            # === EMERGENCY CHECK 2: Stuck at same obstacle ===
+            if EMERGENCY_RETURN_ENABLED:
+                if distance < 5.0:  # Near obstacle
+                    if obstacle_start_time is None:
+                        obstacle_start_time = time.time()
+                        last_obstacle_distance = distance
+                    else:
+                        # Check if stuck (distance not decreasing significantly)
+                        time_at_obstacle = time.time() - obstacle_start_time
+                        distance_change = abs(last_obstacle_distance - distance)
+                        
+                        if time_at_obstacle > MAX_STUCK_TIME and distance_change < 0.5:
+                            logger.error(f"🚨 EMERGENCY: Stuck at obstacle for {time_at_obstacle:.0f}s!")
+                            emergency_return_to_start()
                             
-                            # Clear midpoint history after gate passed
-                            mid_history = []
-                            
-                            logger.info(f"🚪 Gate {current_gate_index} passed: {gate_type}")
-                            stop_motors()
+                            with mission_lock:
+                                mission_active = False
                             
                             if sio.connected:
-                                sio.emit('gate_passed', {
-                                    'gate_type': gate_type,
-                                    'gate_index': current_gate_index,
-                                    'distance': round(estimated_distance, 2),
+                                sio.emit('emergency_abort', {
+                                    'reason': 'Stuck at obstacle',
+                                    'time': time_at_obstacle,
+                                    'distance': distance,
                                     'timestamp': datetime.now().isoformat()
                                 })
-
-            # ========== STREAM VIDEO KE DASHBOARD (CLEAN - NO OVERLAY!) ==========
+                            
+                            break
+                else:
+                    # Not near obstacle - reset tracker
+                    obstacle_start_time = None
+                    last_obstacle_distance = None
+            
+            mid_history.append(mid_x_raw)
+            if len(mid_history) > 5:
+                mid_history.pop(0)
+            mid_x = sum(mid_history) / len(mid_history)
+            
+            navigate_to_gate(mid_x, distance)
+            
             current_time = time.time()
-            if current_time - last_send_time >= SEND_INTERVAL:
-                try:
-                    # Encode CLEAN frame (tanpa overlay apapun)
-                    _, buffer = cv2.imencode('.jpg', clean_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                    jpg_base64 = base64.b64encode(buffer).decode('utf-8')
-
-                    # Kirim ke dashboard via Socket.IO
-                    if sio.connected:
-                        sio.emit('video_frame', {'image': jpg_base64})
-                        frame_count += 1
-
-                    last_send_time = current_time
-                except Exception as e:
-                    logger.error(f"⚠️ Frame emit error: {e}")
-
-            # Send obstacles to dashboard (less frequent)
-            if current_time - last_obstacle_send >= OBSTACLE_SEND_INTERVAL:
-                send_obstacles_to_dashboard()
-                last_obstacle_send = current_time
-
-            # Log progress every 100 frames
-            if frame_count % 100 == 0 and frame_count > 0:
-                logger.info(f"📹 Streamed {frame_count} frames to dashboard")
-
-        except Exception as e:
-            logger.error(f"❌ camera_stream_loop error: {e}")
-            stop_motors()
-            time.sleep(0.1)
-
-    logger.info("Camera stream loop stopped")
-
-# ========== OBSTACLE DETECTION ==========
-def detect_obstacles(frame_bgr):
-    """
-    Detect obstacles (NON-BALL objects) using edge detection
-    Excludes red & green balls (gate markers)
-    Returns: list of obstacles with estimated distance and bearing
-    """
-    obstacles = []
-
-    try:
-        # Convert to grayscale
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-
-        # Apply Gaussian blur
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-
-        # Edge detection (Canny)
-        edges = cv2.Canny(blurred, 50, 150)
-        
-        # Dilate edges to connect nearby edges
-        kernel = np.ones((5, 5), np.uint8)
-        edges_dilated = cv2.dilate(edges, kernel, iterations=1)
-
-        # Find contours
-        contours, _ = cv2.findContours(edges_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Create mask untuk filter out red & green balls (gate markers)
-        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-        mask_red = cv2.bitwise_or(
-            cv2.inRange(hsv, RED_LOWER1, RED_UPPER1),
-            cv2.inRange(hsv, RED_LOWER2, RED_UPPER2)
-        )
-        mask_green = cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER)
-        mask_balls = cv2.bitwise_or(mask_red, mask_green)
-        mask_balls = cv2.dilate(mask_balls, kernel, iterations=3)  # Expand ball mask
-
-        for contour in contours:
-            area = cv2.contourArea(contour)
-
-            # Filter by minimum area
-            if area < OBSTACLE_MIN_AREA:
-                continue
-
-            # Get bounding box
-            x, y, w, h = cv2.boundingRect(contour)
-            
-            # Filter by minimum width (avoid thin vertical lines)
-            if w < OBSTACLE_MIN_WIDTH:
-                continue
-            
-            # Check if contour overlaps with ball mask (FILTER OUT BALLS!)
-            cx, cy = x + w // 2, y + h // 2
-            if mask_balls[cy, cx] > 0:
-                # This contour is a ball (red/green), skip it!
-                continue
-
-            # Calculate center point
-            center_x = cx
-            center_y = cy
-
-            # Estimate distance using size-based method
-            if w > 0:
-                distance = (OBSTACLE_REFERENCE_WIDTH * FOCAL_LENGTH) / w
-                distance = min(distance, MAX_OBSTACLE_DISTANCE)
-            else:
-                distance = MAX_OBSTACLE_DISTANCE
-
-            # Calculate bearing (angle from center)
-            offset_from_center = center_x - (CAMERA_WIDTH / 2)
-            bearing_deg = (offset_from_center / CAMERA_WIDTH) * 60  # FOV ~60 degrees
-
-            obstacles.append({
-                'bbox': (x, y, w, h),
-                'center': (center_x, center_y),
-                'distance': round(distance, 2),
-                'bearing': round(bearing_deg, 1),
-                'area': int(area)
-            })
-
-        # Sort by distance (closest first)
-        obstacles.sort(key=lambda o: o['distance'])
-
-        # Keep only top 3 closest obstacles
-        obstacles = obstacles[:3]
-
-    except Exception as e:
-        logger.error(f"Obstacle detection error: {e}")
-
-    return obstacles
-
-def calculate_obstacle_gps_position(obstacle_distance, obstacle_bearing):
-    """
-    Calculate GPS position of obstacle based on ASV position, heading, and obstacle bearing
-
-    Args:
-        obstacle_distance: distance in meters
-        obstacle_bearing: bearing relative to ASV heading (degrees, -30 to +30)
-
-    Returns:
-        (lat, lon) of obstacle or None
-    """
-    try:
-        with gps_data_lock:
-            asv_lat = latest_gps_data.get('Latitude_DD')
-            asv_lon = latest_gps_data.get('Longitude_DD')
-            asv_heading = latest_gps_data.get('COG_deg', '0')
-
-        if not asv_lat or not asv_lon:
-            return None
-
-        asv_lat = float(asv_lat)
-        asv_lon = float(asv_lon)
-        asv_heading = float(asv_heading)
-
-        # Absolute bearing = ASV heading + relative bearing
-        absolute_bearing = (asv_heading + obstacle_bearing) % 360
-
-        # Convert to radians
-        bearing_rad = math.radians(absolute_bearing)
-
-        # Earth radius in meters
-        R = 6371000
-
-        # Calculate new position
-        # Formula: Haversine forward calculation
-        angular_distance = obstacle_distance / R
-
-        lat1 = math.radians(asv_lat)
-        lon1 = math.radians(asv_lon)
-
-        lat2 = math.asin(
-            math.sin(lat1) * math.cos(angular_distance) +
-            math.cos(lat1) * math.sin(angular_distance) * math.cos(bearing_rad)
-        )
-
-        lon2 = lon1 + math.atan2(
-            math.sin(bearing_rad) * math.sin(angular_distance) * math.cos(lat1),
-            math.cos(angular_distance) - math.sin(lat1) * math.sin(lat2)
-        )
-
-        # Convert back to degrees
-        obstacle_lat = math.degrees(lat2)
-        obstacle_lon = math.degrees(lon2)
-
-        return (obstacle_lat, obstacle_lon)
-
-    except Exception as e:
-        logger.error(f"Calculate obstacle GPS error: {e}")
-        return None
-
-def send_obstacles_to_dashboard():
-    """Send detected obstacles to dashboard for map visualization"""
-    global latest_obstacles
-
-    try:
-        with obstacle_lock:
-            if not latest_obstacles:
-                return
-
-            # Calculate GPS positions for each obstacle
-            obstacles_with_gps = []
-            for obs in latest_obstacles:
-                gps_pos = calculate_obstacle_gps_position(
-                    obs['distance'],
-                    obs['bearing']
-                )
-
-                if gps_pos:
-                    obstacles_with_gps.append({
-                        'lat': gps_pos[0],
-                        'lon': gps_pos[1],
-                        'distance': obs['distance'],
-                        'bearing': obs['bearing'],
-                        'type': 'unknown',  # Could be 'buoy', 'boat', 'debris', etc.
+            if distance < 2.0 and (current_time - last_obstacle_time) > 4.0:
+                obstacles_in_segment += 1
+                total_obstacles_passed += 1
+                last_obstacle_time = current_time
+                mid_history = []
+                
+                # Reset emergency trackers
+                obstacle_start_time = None
+                last_obstacle_distance = None
+                
+                logger.info("=" * 60)
+                logger.info(f"🚪✅ OBSTACLE {total_obstacles_passed}/{TOTAL_OBSTACLES}")
+                logger.info(f"   Segment {current_segment + 1}: {obstacles_in_segment}/{SEGMENT_OBSTACLES[current_segment]}")
+                logger.info("=" * 60)
+                
+                stop_motors()
+                time.sleep(0.3)
+                
+                capture_photo(frame, total_obstacles_passed)
+                
+                if sio.connected:
+                    sio.emit('obstacle_passed', {
+                        'obstacle_num': total_obstacles_passed,
+                        'segment': current_segment + 1,
+                        'distance': round(distance, 2),
                         'timestamp': datetime.now().isoformat()
                     })
-
-            # Emit to dashboard
-            if sio.connected and obstacles_with_gps:
-                sio.emit('obstacles_detected', {
-                    'obstacles': obstacles_with_gps,
-                    'count': len(obstacles_with_gps)
-                })
-                logger.info(f"📍 Sent {len(obstacles_with_gps)} obstacles to dashboard")
-
-    except Exception as e:
-        logger.error(f"Send obstacles error: {e}")
-
-# ========== COMMAND INTERFACE ==========
-def command_interface():
-    """Interactive command interface"""
-    global mission_sm
-
-    logger.info("Command interface started (type 'help' for commands)")
-    print("\n🎮 Command Interface Active")
-    print("   Commands: help, surface, underwater, status, quit")
-    print("   Mission: mission start, mission stop, mission status, mission abort")
-
-    while not stop_event.is_set():
-        try:
-            cmd = input("\n> ").strip().lower()
-
-            if cmd == "help":
-                print("Commands:")
-                print("  surface          - Take surface photo manually")
-                print("  underwater       - Take underwater photo manually")
-                print("  status           - Show system status")
-                print("  mission start    - Start autonomous mission")
-                print("  mission stop     - Stop mission gracefully")
-                print("  mission abort    - Emergency abort mission")
-                print("  mission status   - Show mission state")
-                print("  quit/exit        - Shutdown system")
-
-            elif cmd == "surface":
-                with frame_lock:
-                    if latest_frame is not None:
-                        save_and_emit_photo(latest_frame.copy(), "surface", 0)
-                        print("✅ Surface photo captured")
+                
+                time.sleep(1.5)
+                
+                if obstacles_in_segment >= SEGMENT_OBSTACLES[current_segment]:
+                    logger.info(f"✅ SEGMENT {current_segment + 1} COMPLETE!")
+                    
+                    if current_segment < len(SEGMENT_OBSTACLES) - 1:
+                        move_to_next_segment()
                     else:
-                        print("❌ No frame available")
-
-            elif cmd == "underwater":
-                if camera_underwater and camera_underwater.isOpened():
-                    ret, frame = camera_underwater.read()
-                    if ret:
-                        save_and_emit_photo(frame, "underwater", 0)
-                        print("✅ Underwater photo captured")
-                    else:
-                        print("❌ Underwater camera read failed")
-                else:
-                    print("❌ Underwater camera not available")
-
-            elif cmd == "status":
-                with gps_data_lock:
-                    print(f"   GPS: {latest_gps_data.get('Latitude_DD', 'N/A')}, {latest_gps_data.get('Longitude_DD', 'N/A')}")
-                    print(f"   Speed: {latest_gps_data.get('SOG_knot', 'N/A')} knots")
-                    print(f"   Heading: {latest_gps_data.get('COG_deg', 'N/A')}°")
-                    print(f"   Battery: {latest_gps_data.get('Battery_', 'N/A')}%")
-                print(f"   Camera Nav: {'OK' if camera_nav else 'N/A'}")
-                print(f"   Camera Under: {'OK' if camera_underwater else 'N/A'}")
-                print(f"   Socket.IO: {'Connected' if sio.connected else 'Disconnected'}")
-
-            elif cmd == "mission start":
-                if mission_sm and mission_sm.state.name != 'IDLE':
-                    print("❌ Mission already running")
-                else:
-                    mission_sm = MissionStateMachine(
-                        gates=GATES_LIST,
-                        config=MISSION_CFG,
-                        on_capture=on_capture_callback,
-                        on_lower=on_lower_callback,
-                        on_raise=on_raise_callback,
-                        on_navigate=on_navigate_callback,
-                        emit_event=on_emit_event,
-                    )
-                    mission_sm.start()
-                    print("✅ Mission STARTED!")
-
-            elif cmd == "mission stop":
-                if mission_sm:
-                    mission_sm.stop()
-                    print("✅ Mission STOPPED")
-                else:
-                    print("❌ No mission running")
-
-            elif cmd == "mission abort":
-                if mission_sm:
-                    mission_sm.abort("Manual abort from command interface")
-                    print("⚠️ Mission ABORTED")
-                else:
-                    print("❌ No mission running")
-
-            elif cmd == "mission status":
-                if mission_sm:
-                    print(f"   State: {mission_sm.state.name}")
-                    print(f"   Gate: {mission_sm.current_gate_idx}/{len(GATES_LIST)-1}")
-                    print(f"   Position: ({mission_sm.lat:.6f}, {mission_sm.lon:.6f})" if mission_sm.lat else "   Position: N/A")
-                    print(f"   Speed: {mission_sm.speed:.2f} m/s")
-                    print(f"   Heading: {mission_sm.heading:.1f}°")
-                else:
-                    print("❌ Mission not initialized")
-
-            elif cmd in ["quit", "exit"]:
-                print("🛑 Shutting down...")
-                stop_event.set()
-                break
-
-            else:
-                print(f"❌ Unknown command: {cmd}")
-
-        except EOFError:
-            stop_event.set()
-            break
-        except Exception:
-            logger.exception("❌ command_interface error")
-            time.sleep(0.2)
+                        logger.info("🏆 ALL COMPLETE!")
+                        return_to_start()
+                        
+                        with mission_lock:
+                            mission_active = False
+                        
+                        if sio.connected:
+                            sio.emit('mission_complete', {
+                                'total_obstacles': total_obstacles_passed,
+                                'timestamp': datetime.now().isoformat()
+                            })
+                        
+                        logger.info("🎉 SUCCESS!")
+                        break
+            
+            if sio.connected and frame_count % 2 == 0:
+                _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                jpg_base64 = base64.b64encode(buffer).decode('utf-8')
+                sio.emit('video_frame', {'image': jpg_base64})
+            
+            frame_count += 1
+            
+            if frame_count % 50 == 0:
+                logger.info(f"📹 Frame {frame_count}, Progress: {total_obstacles_passed}/{TOTAL_OBSTACLES}")
+        
+        except Exception as e:
+            logger.error(f"❌ Error: {e}")
+            stop_motors()
+            time.sleep(0.5)
 
 # ========== MAIN ==========
 def main():
-    global SOCKETIO_SERVER, CAMERA_NAVIGATION, CAMERA_UNDERWATER, SEND_FPS, mission_sm
-
-    parser = argparse.ArgumentParser(description='SAIBATIN AZURA 1.0')
-    parser.add_argument('--server', default=SOCKETIO_SERVER, help='Socket.IO server URL')
-    parser.add_argument('--camera-nav', type=int, default=CAMERA_NAVIGATION, help='Navigation camera index')
-    parser.add_argument('--camera-under', type=int, default=CAMERA_UNDERWATER, help='Underwater camera index')
-    parser.add_argument('--send-fps', type=int, default=SEND_FPS, help='Video streaming FPS')
-    args = parser.parse_args()
-
-    SOCKETIO_SERVER = args.server
-    CAMERA_NAVIGATION = args.camera_nav
-    CAMERA_UNDERWATER = args.camera_under
-    SEND_FPS = max(1, args.send_fps)
-
-    logger.info("🚀 SAIBATIN AZURA 1.0 - STARTING (with Mission SM)")
+    global camera_nav
+    
     logger.info("=" * 60)
-
-    # Connect to dashboard (background)
-    logger.info("📡 Starting background connection to Dashboard...")
-    threading.Thread(target=connect_to_server_background, daemon=True).start()
-
-    # Connect to Pixhawk
-    logger.info("🔌 Connecting to Pixhawk...")
-    connect_pixhawk()
+    logger.info("🚀 SAIBATIN AZURA 1.0 - COMPETITION")
+    logger.info(f"   Emergency Return: {'ENABLED ✅' if EMERGENCY_RETURN_ENABLED else 'DISABLED ❌'}")
+    logger.info("=" * 60)
     
-    # Initialize GPIO motors
-    logger.info("⚡ Initializing GPIO motor control...")
-    init_gpio_motors()
-
-    # Initialize cameras
-    logger.info("🎥 Initializing cameras...")
-    if not init_dual_cameras():
-        logger.error("❌ Failed to initialize navigation camera - cannot proceed")
-        return
-
-    # Start GPS thread
-    gps_thread = threading.Thread(target=read_gps_data, daemon=True)
-    gps_thread.start()
-    logger.info("✅ GPS thread started")
-
-    # Start dashboard update thread
-    dash_thread = threading.Thread(target=send_dashboard_update, daemon=True)
-    dash_thread.start()
-    logger.info("✅ Dashboard update thread started")
-    
-    # Start telemetry forwarder
-    tf_thread = threading.Thread(target=telemetry_forwarder, daemon=True)
-    tf_thread.start()
-    logger.info("✅ Telemetry forwarder started")
-    
-    # Initialize mission state machine
-    mission_sm = MissionStateMachine(
-        gates=GATES_LIST,
-        config=MISSION_CFG,
-        on_capture=on_capture_callback,
-        on_lower=on_lower_callback,
-        on_raise=on_raise_callback,
-        on_navigate=on_navigate_callback,
-        emit_event=on_emit_event,
-    )
-    logger.info("✅ Mission state machine initialized (not started yet)")
-
-    # Start command interface thread
-    cmd_thread = threading.Thread(target=command_interface, daemon=True)
-    cmd_thread.start()
-    logger.info("✅ Command interface started")
-
-    # Start camera stream loop in main thread
     try:
-        logger.info("🎥 Camera streaming started")
-        camera_stream_loop()
+        threading.Thread(target=connect_to_server_background, daemon=True).start()
+        
+        logger.info("⚡ Initializing motors...")
+        if not init_motors():
+            logger.error("❌ Motor failed")
+            return
+        
+        logger.info("🎥 Initializing camera...")
+        camera_nav = cv2.VideoCapture(CAMERA_NAVIGATION)
+        if not camera_nav.isOpened():
+            logger.error("❌ Camera failed")
+            return
+        
+        camera_nav.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        camera_nav.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        camera_nav.set(cv2.CAP_PROP_FPS, 30)
+        
+        logger.info("✅ Camera OK")
+        
+        logger.info("\n" + "=" * 60)
+        logger.info("✅ SYSTEM READY!")
+        logger.info("   Commands:")
+        logger.info("   • start     - Start mission")
+        logger.info("   • stop      - Stop mission")
+        logger.info("   • return    - Return to START")
+        logger.info("   • emergency - Emergency return")
+        logger.info("   • status    - Show status")
+        logger.info("   • quit      - Exit program")
+        logger.info("   Or use dashboard buttons")
+        logger.info("=" * 60 + "\n")
+        
+        def command_interface():
+            global mission_active
+            while not stop_event.is_set():
+                try:
+                    cmd = input("> ").strip().lower()
+                    if cmd == 'start':
+                        with mission_lock:
+                            mission_active = True
+                        logger.info("🚀 STARTED!")
+                    
+                    elif cmd == 'stop':
+                        with mission_lock:
+                            mission_active = False
+                        stop_motors()
+                        logger.info("🛑 STOPPED")
+                    
+                    elif cmd == 'return':
+                        # Manual return to start
+                        logger.info("🏁 RETURN TO START command")
+                        with mission_lock:
+                            mission_active = False
+                        stop_motors()
+                        time.sleep(0.5)
+                        emergency_return_to_start()
+                    
+                    elif cmd == 'emergency':
+                        # Manual emergency return
+                        logger.info("🚨 Manual emergency return!")
+                        emergency_return_to_start()
+                        with mission_lock:
+                            mission_active = False
+                    
+                    elif cmd == 'quit':
+                        stop_event.set()
+                        break
+                    
+                    elif cmd == 'status':
+                        with mission_lock:
+                            status = "ACTIVE" if mission_active else "STANDBY"
+                        logger.info(f"Status: {status}, Obstacles: {total_obstacles_passed}/{TOTAL_OBSTACLES}")
+                    
+                    elif cmd == 'help':
+                        logger.info("Commands:")
+                        logger.info("  start     - Start mission")
+                        logger.info("  stop      - Stop mission")
+                        logger.info("  return    - Return to START")
+                        logger.info("  emergency - Emergency return")
+                        logger.info("  status    - Show status")
+                        logger.info("  quit      - Exit")
+                except:
+                    break
+        
+        threading.Thread(target=command_interface, daemon=True).start()
+        
+        mission_loop_lintasan_a()
+    
     except KeyboardInterrupt:
-        logger.info("🛑 Ctrl+C received - shutting down...")
-        stop_event.set()
-    except Exception:
-        logger.exception("❌ main loop unexpected error")
-        stop_event.set()
+        logger.info("\n🛑 Ctrl+C")
+    
+    except Exception as e:
+        logger.exception(f"❌ Fatal: {e}")
+    
     finally:
-        # Signal threads to stop
+        logger.info("🧹 Cleanup...")
         stop_event.set()
-        time.sleep(0.5)
+        stop_motors()
         
-        # Stop mission state machine
-        if mission_sm:
-            try:
-                mission_sm.stop()
-                logger.info("✅ Mission state machine stopped")
-            except Exception:
-                pass
-        
-        # Release cameras
         if camera_nav:
             camera_nav.release()
-            logger.info("✅ Navigation camera released")
-        if camera_underwater:
-            camera_underwater.release()
-            logger.info("✅ Underwater camera released")
         
-        # Disconnect socket
         if sio.connected:
             sio.disconnect()
-            logger.info("✅ Disconnected from dashboard")
         
-        # Cleanup GPIO motors
-        if GPIO_AVAILABLE and pwm_left_gpio and pwm_right_gpio:
+        if GPIO_AVAILABLE:
             try:
-                pwm_left_gpio.stop()
-                pwm_right_gpio.stop()
+                if pwm_left_gpio:
+                    pwm_left_gpio.stop()
+                if pwm_right_gpio:
+                    pwm_right_gpio.stop()
                 GPIO.cleanup()
-                logger.info("✅ GPIO motors cleaned up")
-            except Exception:
+            except:
                 pass
         
         logger.info("👋 Shutdown complete")

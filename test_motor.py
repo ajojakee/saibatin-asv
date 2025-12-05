@@ -1,327 +1,349 @@
 #!/usr/bin/env python3
 """
-SAIBATIN AZURA 1.0 - Motor Test Script
-Test 2 ESC motors connected to Pixhawk PWM Channel 4 & 5
+MOTOR TEST PROGRAM - SAIBATIN AZURA 1.0
+Test motor control langsung tanpa dashboard
 """
 
 import time
 import sys
 
 try:
-    from pymavlink import mavutil
-    MAVLINK_AVAILABLE = True
+    import RPi.GPIO as GPIO
+    GPIO_AVAILABLE = True
 except ImportError:
-    print("ERROR: pymavlink not installed!")
-    print("Run: pip3 install pymavlink")
+    print("❌ RPi.GPIO not available - cannot test motors")
     sys.exit(1)
 
-# ========== CONFIGURATION ==========
-PIXHAWK_PORTS = ["/dev/ttyAMA0", "/dev/ttyACM0", "/dev/ttyUSB0"]
-PIXHAWK_BAUD = 57600
+# ========== CONFIG ==========
+MOTOR_LEFT_GPIO = 18   # GPIO 18 - Motor Kiri
+MOTOR_RIGHT_GPIO = 13  # GPIO 13 - Motor Kanan
+PWM_FREQ = 50          # 50Hz for ESC
 
-PWM_MIN = 1100  # Minimum PWM (full reverse)
-PWM_MID = 1500  # Neutral PWM (stop)
-PWM_MAX = 1900  # Maximum PWM (full forward)
+# ========== INIT GPIO ==========
+def init_motors():
+    """Initialize GPIO motors"""
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    
+    GPIO.setup(MOTOR_LEFT_GPIO, GPIO.OUT)
+    GPIO.setup(MOTOR_RIGHT_GPIO, GPIO.OUT)
+    
+    pwm_left = GPIO.PWM(MOTOR_LEFT_GPIO, PWM_FREQ)
+    pwm_right = GPIO.PWM(MOTOR_RIGHT_GPIO, PWM_FREQ)
+    
+    # Start at neutral (1500µs = 7.5% duty cycle)
+    pwm_left.start(7.5)
+    pwm_right.start(7.5)
+    
+    print("✅ Motors initialized")
+    print(f"   Left: GPIO {MOTOR_LEFT_GPIO}")
+    print(f"   Right: GPIO {MOTOR_RIGHT_GPIO}")
+    
+    return pwm_left, pwm_right
 
-# Motor channels
-MOTOR_LEFT_CHANNEL = 4   # ESC 1 di channel 4
-MOTOR_RIGHT_CHANNEL = 5  # ESC 2 di channel 5
+def set_motor(pwm, speed_percent):
+    """Set motor speed (-100 to +100)"""
+    duty_cycle = 7.5 + (speed_percent / 100.0) * 2.5
+    duty_cycle = max(5.0, min(10.0, duty_cycle))
+    pwm.ChangeDutyCycle(duty_cycle)
 
-# ========== CONNECT TO PIXHAWK ==========
-def connect_pixhawk():
-    print("=" * 60)
-    print("   SAIBATIN MOTOR TEST")
-    print("=" * 60)
-    print("\nConnecting to Pixhawk...")
-    
-    for port in PIXHAWK_PORTS:
-        try:
-            print(f"  Trying {port}...")
-            connection = mavutil.mavlink_connection(port, baud=PIXHAWK_BAUD)
-            connection.wait_heartbeat(timeout=5)
-            print(f"✅ Connected to Pixhawk on {port}")
-            print(f"   System ID: {connection.target_system}")
-            print(f"   Component ID: {connection.target_component}")
-            return connection
-        except Exception as e:
-            print(f"  ❌ Failed: {e}")
-            continue
-    
-    print("\n❌ ERROR: Cannot connect to Pixhawk!")
-    print("Check:")
-    print("  1. Pixhawk is powered on")
-    print("  2. USB cable is connected")
-    print("  3. Port permissions: sudo usermod -aG dialout $USER")
-    sys.exit(1)
+def stop_motors(pwm_left, pwm_right):
+    """Stop both motors"""
+    set_motor(pwm_left, 0)
+    set_motor(pwm_right, 0)
+    print("🛑 Motors stopped")
 
-# ========== MOTOR CONTROL FUNCTIONS ==========
-def set_motor_pwm(connection, channel, pwm_value):
-    """
-    Send PWM value to specific motor channel
-    channel: 4 (left) or 5 (right)
-    pwm_value: 1100-1900
-    """
-    pwm_value = max(PWM_MIN, min(PWM_MAX, pwm_value))
+# ========== TEST SEQUENCES ==========
+def test_individual_motors(pwm_left, pwm_right):
+    """Test each motor individually"""
+    print("\n=== TEST 1: Individual Motor Test ===")
     
-    # Create RC override array (18 channels for newer protocol)
-    rc_channels = [65535] * 18  # 65535 = no change
-    rc_channels[channel - 1] = pwm_value  # Set specific channel
+    # Test LEFT motor
+    print("\n🔄 Testing LEFT motor...")
+    print("   Forward 30% for 3 seconds...")
+    set_motor(pwm_left, 30)
+    time.sleep(3)
     
-    # Send RC override (UPDATED - use newer message format)
-    connection.mav.rc_channels_override_send(
-        connection.target_system,
-        connection.target_component,
-        *rc_channels[:8]  # First 8 channels
-    )
-    
-    # TAMBAHAN: Send servo command sebagai backup
-    connection.mav.command_long_send(
-        connection.target_system,
-        connection.target_component,
-        mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
-        0,  # confirmation
-        channel,  # param1: servo number
-        pwm_value,  # param2: PWM value
-        0, 0, 0, 0, 0
-    )
-    
-    return pwm_value
-
-def stop_motors(connection):
-    """Stop both motors (PWM = 1500)"""
-    set_motor_pwm(connection, MOTOR_LEFT_CHANNEL, PWM_MID)
-    set_motor_pwm(connection, MOTOR_RIGHT_CHANNEL, PWM_MID)
-    print("🛑 Motors STOPPED (PWM 1500)")
-
-def test_motor_left(connection):
-    """Test left motor (Channel 4)"""
-    print("\n" + "=" * 60)
-    print("TEST: LEFT MOTOR (Channel 4)")
-    print("=" * 60)
-    
-    # Forward
-    print("\n1. Forward (PWM 1600)...")
-    set_motor_pwm(connection, MOTOR_LEFT_CHANNEL, 1600)
+    print("   Stop for 2 seconds...")
+    set_motor(pwm_left, 0)
     time.sleep(2)
     
-    # Stop
-    print("2. Stop (PWM 1500)...")
-    set_motor_pwm(connection, MOTOR_LEFT_CHANNEL, PWM_MID)
-    time.sleep(1)
+    print("   Reverse 30% for 3 seconds...")
+    set_motor(pwm_left, -30)
+    time.sleep(3)
     
-    # Reverse
-    print("3. Reverse (PWM 1400)...")
-    set_motor_pwm(connection, MOTOR_LEFT_CHANNEL, 1400)
+    print("   Stop")
+    set_motor(pwm_left, 0)
     time.sleep(2)
     
-    # Stop
-    print("4. Stop (PWM 1500)...")
-    set_motor_pwm(connection, MOTOR_LEFT_CHANNEL, PWM_MID)
-    time.sleep(1)
+    # Test RIGHT motor
+    print("\n🔄 Testing RIGHT motor...")
+    print("   Forward 30% for 3 seconds...")
+    set_motor(pwm_right, 30)
+    time.sleep(3)
     
-    print("✅ Left motor test complete")
-
-def test_motor_right(connection):
-    """Test right motor (Channel 5)"""
-    print("\n" + "=" * 60)
-    print("TEST: RIGHT MOTOR (Channel 5)")
-    print("=" * 60)
-    
-    # Forward
-    print("\n1. Forward (PWM 1600)...")
-    set_motor_pwm(connection, MOTOR_RIGHT_CHANNEL, 1600)
+    print("   Stop for 2 seconds...")
+    set_motor(pwm_right, 0)
     time.sleep(2)
     
-    # Stop
-    print("2. Stop (PWM 1500)...")
-    set_motor_pwm(connection, MOTOR_RIGHT_CHANNEL, PWM_MID)
-    time.sleep(1)
+    print("   Reverse 30% for 3 seconds...")
+    set_motor(pwm_right, -30)
+    time.sleep(3)
     
-    # Reverse
-    print("3. Reverse (PWM 1400)...")
-    set_motor_pwm(connection, MOTOR_RIGHT_CHANNEL, 1400)
+    print("   Stop")
+    set_motor(pwm_right, 0)
+    time.sleep(2)
+
+def test_forward_backward(pwm_left, pwm_right):
+    """Test forward and backward movement"""
+    print("\n=== TEST 2: Forward/Backward Test ===")
+    
+    print("\n➡️ Forward 50% for 5 seconds...")
+    set_motor(pwm_left, 50)
+    set_motor(pwm_right, 50)
+    time.sleep(5)
+    
+    print("   Stop for 2 seconds...")
+    stop_motors(pwm_left, pwm_right)
     time.sleep(2)
     
-    # Stop
-    print("4. Stop (PWM 1500)...")
-    set_motor_pwm(connection, MOTOR_RIGHT_CHANNEL, PWM_MID)
-    time.sleep(1)
+    print("⬅️ Backward 50% for 5 seconds...")
+    set_motor(pwm_left, -50)
+    set_motor(pwm_right, -50)
+    time.sleep(5)
     
-    print("✅ Right motor test complete")
+    print("   Stop")
+    stop_motors(pwm_left, pwm_right)
+    time.sleep(2)
 
-def test_differential_drive(connection):
-    """Test differential drive (both motors)"""
-    print("\n" + "=" * 60)
-    print("TEST: DIFFERENTIAL DRIVE (Both Motors)")
-    print("=" * 60)
+def test_turning(pwm_left, pwm_right):
+    """Test turning movements"""
+    print("\n=== TEST 3: Turning Test ===")
     
-    # Straight forward
-    print("\n1. Straight Forward...")
-    set_motor_pwm(connection, MOTOR_LEFT_CHANNEL, 1600)
-    set_motor_pwm(connection, MOTOR_RIGHT_CHANNEL, 1600)
+    print("\n↪️ Turn RIGHT (left motor 50%, right 0%) for 3 seconds...")
+    set_motor(pwm_left, 50)
+    set_motor(pwm_right, 0)
     time.sleep(3)
-    stop_motors(connection)
-    time.sleep(1)
     
-    # Turn left (right motor faster)
-    print("\n2. Turn Left...")
-    set_motor_pwm(connection, MOTOR_LEFT_CHANNEL, 1550)
-    set_motor_pwm(connection, MOTOR_RIGHT_CHANNEL, 1650)
+    print("   Stop for 2 seconds...")
+    stop_motors(pwm_left, pwm_right)
+    time.sleep(2)
+    
+    print("↩️ Turn LEFT (right motor 50%, left 0%) for 3 seconds...")
+    set_motor(pwm_left, 0)
+    set_motor(pwm_right, 50)
     time.sleep(3)
-    stop_motors(connection)
-    time.sleep(1)
     
-    # Turn right (left motor faster)
-    print("\n3. Turn Right...")
-    set_motor_pwm(connection, MOTOR_LEFT_CHANNEL, 1650)
-    set_motor_pwm(connection, MOTOR_RIGHT_CHANNEL, 1550)
-    time.sleep(3)
-    stop_motors(connection)
-    time.sleep(1)
-    
-    # Straight reverse
-    print("\n4. Straight Reverse...")
-    set_motor_pwm(connection, MOTOR_LEFT_CHANNEL, 1400)
-    set_motor_pwm(connection, MOTOR_RIGHT_CHANNEL, 1400)
-    time.sleep(3)
-    stop_motors(connection)
-    
-    print("✅ Differential drive test complete")
+    print("   Stop")
+    stop_motors(pwm_left, pwm_right)
+    time.sleep(2)
 
-def manual_control(connection):
-    """Manual motor control via keyboard"""
-    print("\n" + "=" * 60)
-    print("MANUAL CONTROL MODE")
-    print("=" * 60)
-    print("\nControls:")
-    print("  W - Forward")
-    print("  S - Reverse")
-    print("  A - Turn Left")
-    print("  D - Turn Right")
-    print("  SPACE - Stop")
-    print("  Q - Quit")
-    print("\nPress keys to control motors...")
+def test_differential_drive(pwm_left, pwm_right):
+    """Test differential drive patterns"""
+    print("\n=== TEST 4: Differential Drive Test ===")
     
-    try:
-        import tty
-        import termios
+    sequences = [
+        ("Forward straight", 50, 50, 3),
+        ("Gentle right turn", 70, 50, 3),
+        ("Gentle left turn", 50, 70, 3),
+        ("Sharp right turn", 70, 30, 3),
+        ("Sharp left turn", 30, 70, 3),
+        ("Spin right (on spot)", 50, -50, 3),
+        ("Spin left (on spot)", -50, 50, 3),
+    ]
+    
+    for description, left_speed, right_speed, duration in sequences:
+        print(f"\n🔄 {description}...")
+        print(f"   Left: {left_speed}%, Right: {right_speed}% for {duration}s")
+        set_motor(pwm_left, left_speed)
+        set_motor(pwm_right, right_speed)
+        time.sleep(duration)
         
-        old_settings = termios.tcgetattr(sys.stdin)
-        tty.setcbreak(sys.stdin.fileno())
-        
-        while True:
-            char = sys.stdin.read(1).lower()
-            
-            if char == 'w':
-                print("⬆️ Forward")
-                set_motor_pwm(connection, MOTOR_LEFT_CHANNEL, 1600)
-                set_motor_pwm(connection, MOTOR_RIGHT_CHANNEL, 1600)
-            
-            elif char == 's':
-                print("⬇️ Reverse")
-                set_motor_pwm(connection, MOTOR_LEFT_CHANNEL, 1400)
-                set_motor_pwm(connection, MOTOR_RIGHT_CHANNEL, 1400)
-            
-            elif char == 'a':
-                print("⬅️ Turn Left")
-                set_motor_pwm(connection, MOTOR_LEFT_CHANNEL, 1550)
-                set_motor_pwm(connection, MOTOR_RIGHT_CHANNEL, 1650)
-            
-            elif char == 'd':
-                print("➡️ Turn Right")
-                set_motor_pwm(connection, MOTOR_LEFT_CHANNEL, 1650)
-                set_motor_pwm(connection, MOTOR_RIGHT_CHANNEL, 1550)
-            
-            elif char == ' ':
-                print("🛑 Stop")
-                stop_motors(connection)
-            
-            elif char == 'q':
-                print("\nExiting manual control...")
-                stop_motors(connection)
-                break
-        
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-        
-    except ImportError:
-        print("⚠️ Manual control not available on this platform")
-        print("Use automated tests instead")
+        print("   Stop for 2 seconds...")
+        stop_motors(pwm_left, pwm_right)
+        time.sleep(2)
 
-def interactive_menu(connection):
-    """Interactive test menu"""
+def test_speed_ramp(pwm_left, pwm_right):
+    """Test gradual speed increase/decrease"""
+    print("\n=== TEST 5: Speed Ramp Test ===")
+    
+    print("\n⬆️ Ramping up (0% → 80%)...")
+    for speed in range(0, 81, 10):
+        print(f"   Speed: {speed}%")
+        set_motor(pwm_left, speed)
+        set_motor(pwm_right, speed)
+        time.sleep(1)
+    
+    print("\n⬇️ Ramping down (80% → 0%)...")
+    for speed in range(80, -1, -10):
+        print(f"   Speed: {speed}%")
+        set_motor(pwm_left, speed)
+        set_motor(pwm_right, speed)
+        time.sleep(1)
+    
+    print("   Stop")
+    stop_motors(pwm_left, pwm_right)
+
+# ========== INTERACTIVE MODE ==========
+def interactive_mode(pwm_left, pwm_right):
+    """Manual control mode"""
+    print("\n=== INTERACTIVE MODE ===")
+    print("Commands:")
+    print("  w = Forward    s = Backward")
+    print("  a = Left       d = Right")
+    print("  q = Spin left  e = Spin right")
+    print("  x = Stop       + = Increase speed")
+    print("  - = Decrease speed")
+    print("  0 = Exit")
+    
+    speed = 50
+    
     while True:
-        print("\n" + "=" * 60)
-        print("MOTOR TEST MENU")
-        print("=" * 60)
-        print("1. Test Left Motor (Channel 4)")
-        print("2. Test Right Motor (Channel 5)")
-        print("3. Test Differential Drive (Both Motors)")
-        print("4. Manual Control (Keyboard)")
-        print("5. Stop Motors")
-        print("6. Exit")
-        print("=" * 60)
-        
         try:
-            choice = input("\nSelect test (1-6): ").strip()
+            cmd = input(f"\nSpeed: {speed}% > ").strip().lower()
             
-            if choice == '1':
-                test_motor_left(connection)
+            if cmd == 'w':
+                print(f"➡️ Forward {speed}%")
+                set_motor(pwm_left, speed)
+                set_motor(pwm_right, speed)
             
-            elif choice == '2':
-                test_motor_right(connection)
+            elif cmd == 's':
+                print(f"⬅️ Backward {speed}%")
+                set_motor(pwm_left, -speed)
+                set_motor(pwm_right, -speed)
             
-            elif choice == '3':
-                test_differential_drive(connection)
+            elif cmd == 'a':
+                print(f"↩️ Left turn (R:{speed}%, L:0%)")
+                set_motor(pwm_left, 0)
+                set_motor(pwm_right, speed)
             
-            elif choice == '4':
-                manual_control(connection)
+            elif cmd == 'd':
+                print(f"↪️ Right turn (L:{speed}%, R:0%)")
+                set_motor(pwm_left, speed)
+                set_motor(pwm_right, 0)
             
-            elif choice == '5':
-                stop_motors(connection)
+            elif cmd == 'q':
+                print(f"🔄 Spin left")
+                set_motor(pwm_left, -speed)
+                set_motor(pwm_right, speed)
             
-            elif choice == '6':
-                print("\n🛑 Stopping motors...")
-                stop_motors(connection)
-                print("👋 Goodbye!")
+            elif cmd == 'e':
+                print(f"🔄 Spin right")
+                set_motor(pwm_left, speed)
+                set_motor(pwm_right, -speed)
+            
+            elif cmd == 'x':
+                print("🛑 Stop")
+                stop_motors(pwm_left, pwm_right)
+            
+            elif cmd == '+':
+                speed = min(100, speed + 10)
+                print(f"⬆️ Speed increased to {speed}%")
+            
+            elif cmd == '-':
+                speed = max(0, speed - 10)
+                print(f"⬇️ Speed decreased to {speed}%")
+            
+            elif cmd == '0':
+                print("👋 Exiting interactive mode")
                 break
             
             else:
-                print("❌ Invalid choice. Enter 1-6")
+                print("❌ Unknown command")
         
         except KeyboardInterrupt:
-            print("\n\n🛑 Interrupted! Stopping motors...")
-            stop_motors(connection)
+            print("\n🛑 Ctrl+C pressed")
             break
-        
-        except Exception as e:
-            print(f"❌ Error: {e}")
+        except EOFError:
+            break
 
 # ========== MAIN ==========
 def main():
+    print("=" * 60)
+    print("🚀 MOTOR TEST PROGRAM - SAIBATIN AZURA 1.0")
+    print("=" * 60)
+    
     try:
-        # Connect to Pixhawk
-        connection = connect_pixhawk()
+        # Initialize motors
+        pwm_left, pwm_right = init_motors()
         
-        # Safety: Stop motors first
-        print("\n🛑 Safety: Stopping motors...")
-        stop_motors(connection)
-        time.sleep(1)
+        print("\n⚠️ WARNING: ESC akan aktif dalam 5 detik!")
+        print("   Pastikan propeller sudah dipasang atau dilepas!")
+        for i in range(5, 0, -1):
+            print(f"   {i}...")
+            time.sleep(1)
         
-        # Show menu
-        interactive_menu(connection)
+        print("\n🎯 Starting motor tests...\n")
         
+        # Menu
+        while True:
+            print("\n" + "=" * 60)
+            print("MOTOR TEST MENU:")
+            print("  1. Individual motor test")
+            print("  2. Forward/Backward test")
+            print("  3. Turning test")
+            print("  4. Differential drive test")
+            print("  5. Speed ramp test")
+            print("  6. Interactive mode")
+            print("  9. Run ALL tests")
+            print("  0. Exit")
+            print("=" * 60)
+            
+            choice = input("\nSelect test [0-9]: ").strip()
+            
+            if choice == '1':
+                test_individual_motors(pwm_left, pwm_right)
+            
+            elif choice == '2':
+                test_forward_backward(pwm_left, pwm_right)
+            
+            elif choice == '3':
+                test_turning(pwm_left, pwm_right)
+            
+            elif choice == '4':
+                test_differential_drive(pwm_left, pwm_right)
+            
+            elif choice == '5':
+                test_speed_ramp(pwm_left, pwm_right)
+            
+            elif choice == '6':
+                interactive_mode(pwm_left, pwm_right)
+            
+            elif choice == '9':
+                print("\n🚀 Running ALL tests...")
+                test_individual_motors(pwm_left, pwm_right)
+                test_forward_backward(pwm_left, pwm_right)
+                test_turning(pwm_left, pwm_right)
+                test_differential_drive(pwm_left, pwm_right)
+                test_speed_ramp(pwm_left, pwm_right)
+                print("\n✅ All tests completed!")
+            
+            elif choice == '0':
+                print("\n👋 Exiting...")
+                break
+            
+            else:
+                print("❌ Invalid choice")
+    
     except KeyboardInterrupt:
-        print("\n\n🛑 Interrupted!")
-        if 'connection' in locals():
-            stop_motors(connection)
+        print("\n\n🛑 Ctrl+C pressed - stopping...")
     
     except Exception as e:
-        print(f"\n❌ ERROR: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"\n❌ Error: {e}")
     
     finally:
-        print("\n✅ Test completed")
+        # Cleanup
+        print("\n🧹 Cleaning up...")
+        try:
+            stop_motors(pwm_left, pwm_right)
+            pwm_left.stop()
+            pwm_right.stop()
+            GPIO.cleanup()
+            print("✅ GPIO cleaned up")
+        except:
+            pass
+        
+        print("👋 Program terminated")
 
 if __name__ == "__main__":
     main()

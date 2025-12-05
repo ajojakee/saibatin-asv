@@ -5,7 +5,27 @@ Enable RC Override on Pixhawk
 from pymavlink import mavutil
 
 print("Connecting to Pixhawk...")
-connection = mavutil.mavlink_connection('/dev/ttyAMA0', baud=57600)
+connection = mavutil.mavlink_connection('/devWindows IP Configuration
+
+
+Wireless LAN adapter Local Area Connection* 1:
+
+   Media State . . . . . . . . . . . : Media disconnected
+   Connection-specific DNS Suffix  . :
+
+Wireless LAN adapter Local Area Connection* 10:
+
+   Media State . . . . . . . . . . . : Media disconnected
+   Connection-specific DNS Suffix  . :
+
+Wireless LAN adapter Wi-Fi:
+
+   Connection-specific DNS Suffix  . :
+   Link-local IPv6 Address . . . . . : fe80::f876:f90e:806e:9bbf%8
+   IPv4 Address. . . . . . . . . . . : 10.115.96.157
+   Subnet Mask . . . . . . . . . . . : 255.255.255.0
+   Default Gateway . . . . . . . . . : 10.115.96.160
+PS C:\Users\Zaky>/ttyAMA0', baud=57600)
 connection.wait_heartbeat()
 print(f"✅ Connected")
 

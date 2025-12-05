@@ -125,6 +125,32 @@ io.on('connection', (socket) => {
         io.emit('mission_status_update', data);
     });
 
+    // Relay mission commands from dashboard to Raspberry Pi
+    socket.on('mission_command', (data) => {
+        console.log('📥 Mission command:', data);
+        
+        // Broadcast to all connected clients (including Raspberry Pi)
+        io.emit('mission_command', data);
+        
+        // Log specific commands
+        if (data.command === 'start') {
+            console.log('🚀 Mission START command');
+        } else if (data.command === 'stop') {
+            console.log('🛑 Mission STOP command');
+        } else if (data.command === 'return') {
+            console.log('🏁 RETURN TO START command');
+        } else if (data.command === 'abort') {
+            console.log('⚠️ EMERGENCY ABORT command');
+        }
+    });
+    
+    // Listen for mission status updates from Raspberry Pi
+    socket.on('mission_status_update', (data) => {
+        console.log('📊 Mission status update:', data);
+        // Broadcast to all dashboard clients
+        socket.broadcast.emit('mission_status_update', data);
+    });
+    
     socket.on('disconnect', (reason) => {
         clearInterval(keepAlive);
         console.log('❌ Client disconnected:', socket.id, 'Reason:', reason);
@@ -139,6 +165,7 @@ io.on('connection', (socket) => {
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log('========================================');
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
+  console.log(`🚀 Server running on http://saibatinazura.site:${PORT}`);
+  console.log(`   Access dashboard at: http://saibatinazura.site:${PORT}`);
   console.log('========================================');
 });
